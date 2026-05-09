@@ -79,7 +79,7 @@ function createTeamCreateToolForTest(
   config: ReturnType<typeof createConfig>,
   executorConfig?: Parameters<typeof factory>[4],
 ) {
-  return factory(config, {} as never, {} as never, undefined, executorConfig, {
+  return factory(config, { session: { get: async ({ path: { id } }: { path: { id: string } }) => ({ data: { id } }) } } as never, {} as never, undefined, executorConfig, {
     createTeamRun: createTeamRunMock,
     loadTeamSpec: async () => {
       throw new Error("loadTeamSpec should not be called for inline_spec tests")
@@ -285,13 +285,12 @@ describe("createTeamCreateTool inline_spec normalization", () => {
       members: [
         {
           name: "Agent 1: Structure Analyst",
-          kind: "agent",
           role: "Structure Analyst",
           capabilities: ["directory layouts", "module boundaries"],
         },
         {
           name: "Agent 2: Core Logic Analyst",
-          kind: "quick",
+          category: "quick",
           role: "Core Logic Analyst",
           description: "Analyze initialization flow and plugin architecture.",
         },

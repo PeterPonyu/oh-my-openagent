@@ -121,17 +121,30 @@ export const deleteTeamMock = mock(async (
   runtimes.delete(teamRunId)
   return { removedWorktrees: [], removedLayout: false }
 })
-export const requestShutdownOfMemberMock = mock(async (teamRunId: string, targetMemberName: string, requesterName: string) => {
-  requireRuntime(teamRunId).shutdownRequests.push({ memberId: targetMemberName, requesterName, requestedAt: Date.now() })
+export const requestShutdownOfMemberMock = mock(async (
+  teamRunId: string,
+  targetMemberName: string,
+  actor: { memberName: string },
+) => {
+  requireRuntime(teamRunId).shutdownRequests.push({
+    memberId: targetMemberName,
+    requesterName: actor.memberName,
+    requestedAt: Date.now(),
+  })
 })
-export const approveShutdownMock = mock(async (teamRunId: string, memberName: string) => {
+export const approveShutdownMock = mock(async (teamRunId: string, memberName: string, _actor?: { memberName: string }) => {
   const runtimeState = requireRuntime(teamRunId)
   const request = getLatestShutdownRequest(runtimeState, memberName)
   if (request) request.approvedAt = Date.now()
   const member = runtimeState.members.find((candidate) => candidate.name === memberName)
   if (member) member.status = "shutdown_approved"
 })
-export const rejectShutdownMock = mock(async (teamRunId: string, memberName: string, reason: string) => {
+export const rejectShutdownMock = mock(async (
+  teamRunId: string,
+  memberName: string,
+  reason: string,
+  _actor?: { memberName: string },
+) => {
   const request = getLatestShutdownRequest(requireRuntime(teamRunId), memberName)
   if (request) {
     request.rejectedAt = Date.now()
@@ -149,7 +162,11 @@ export const listActiveTeamsMock = mock(async () => Array.from(runtimes.values()
 export const loadRuntimeStateMock = mock(async (teamRunId: string) => clone(requireRuntime(teamRunId)))
 
 export const config = TeamModeConfigSchema.parse({ enabled: true })
-export const mockClient = {} as OpencodeClient
+export const mockClient = {
+  session: {
+    get: async ({ path: { id } }: { path: { id: string } }) => ({ data: { id } }),
+  },
+} as unknown as OpencodeClient
 export const backgroundManager = {} as BackgroundManager
 
 export function resetLifecycleTestState(): void {

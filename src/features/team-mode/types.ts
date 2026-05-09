@@ -1,4 +1,5 @@
 import { z } from "zod"
+import { MemberSelectionModeSchema } from "../../config/schema/team-mode"
 import { createParseMember } from "./member-parser"
 
 export const MESSAGE_KINDS = [
@@ -31,6 +32,11 @@ const MemberBaseSchema = z.object({
   backendType: z.enum(["in-process", "tmux"]).default("in-process"),
   color: z.string().optional(),
   isActive: z.boolean().default(true),
+  // Optional explicit model pick for this team member (e.g.
+  // "anthropic/claude-opus-4-7"). Wins over the team's member_selection
+  // mode (stable seed broadcast / creative round-robin) and the global
+  // agents.<>.model override. Tagged modelIntent: "explicit" at launch.
+  model: z.string().min(1).optional(),
 }).strict()
 
 export const CategoryMemberSchema = MemberBaseSchema.extend({
@@ -63,6 +69,10 @@ export const TeamSpecSchema = z.object({
   teamAllowedPaths: z.array(z.string()).optional(),
   sessionPermission: z.string().optional(),
   members: z.array(MemberSchema).min(1).max(8),
+  // Optional override of team_mode.member_selection. Wins over global
+  // config but loses to the per-call team_create({ member_selection })
+  // argument. Undefined means "inherit from global config".
+  member_selection: MemberSelectionModeSchema.optional(),
 }).superRefine((teamSpec, ctx) => {
   if (teamSpec.leadAgentId === undefined && teamSpec.members.length > 1) {
     ctx.addIssue({
@@ -143,7 +153,9 @@ const RuntimeStateMemberSchema = z.object({
   status: z.enum(["pending", "running", "idle", "errored", "completed", "shutdown_approved"]),
   color: z.string().optional(),
   worktreePath: z.string().optional(),
+  lastSeenTurnMarker: z.string().optional(),
   lastInjectedTurnMarker: z.string().optional(),
+  turnsUsed: z.number().int().nonnegative().optional(),
   pendingInjectedMessageIds: z.array(z.string()).default([]),
 }).strict()
 
@@ -169,6 +181,7 @@ const RuntimeStateTmuxLayoutSchema = z.object({
   targetSessionId: z.string(),
   focusWindowId: z.string().optional(),
   gridWindowId: z.string().optional(),
+  paneIds: z.array(z.string()).optional(),
 }).strict()
 
 export const RuntimeStateSchema = z.object({
@@ -179,9 +192,11 @@ export const RuntimeStateSchema = z.object({
   createdAt: z.number().int().positive(),
   status: z.enum(RUNTIME_STATUSES),
   leadSessionId: z.string().optional(),
+  serverUrl: z.string().optional(),
   tmuxLayout: RuntimeStateTmuxLayoutSchema.optional(),
   members: z.array(RuntimeStateMemberSchema),
   shutdownRequests: z.array(ShutdownRequestSchema).default([]),
+  messageCount: z.number().int().nonnegative().optional(),
   bounds: RuntimeBoundsSchema,
 })
 
@@ -190,11 +205,7 @@ export const AGENT_ELIGIBILITY_REGISTRY: Readonly<Record<string, {
   rejectionMessage?: string
 }>> = {
   sisyphus: { verdict: "eligible" },
-  hephaestus: {
-    verdict: "conditional",
-    rejectionMessage:
-      "Agent 'hephaestus' lacks teammate permission. Either apply D-36 (add teammate: \"allow\" in tool-config-handler.ts) or use subagent_type: \"sisyphus\" instead.",
-  },
+  hephaestus: { verdict: "eligible" },
   oracle: {
     verdict: "hard-reject",
     rejectionMessage:
@@ -236,7 +247,7 @@ export const AGENT_ELIGIBILITY_REGISTRY: Readonly<Record<string, {
 
 /**
  * §V.3 member validation error messages live in member-parser.ts.
- * Includes: "Unknown subagent_type '<name>'. Available ELIGIBLE agents: sisyphus, atlas, sisyphus-junior, hephaestus (if D-36 applied). Use delegate-task for read-only agents like oracle, librarian, explore, metis, momus, multimodal-looker."
+ * Includes: "Unknown subagent_type '<name>'. Available ELIGIBLE agents: sisyphus, atlas, sisyphus-junior, hephaestus. Use delegate-task for read-only agents like oracle, librarian, explore, metis, momus, multimodal-looker."
  */
 
 const parseMemberBase = createParseMember(MemberSchema, AGENT_ELIGIBILITY_REGISTRY)

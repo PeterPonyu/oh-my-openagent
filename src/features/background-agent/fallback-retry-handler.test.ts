@@ -6,6 +6,8 @@ const readProviderModelsCacheMock = mock(() => null)
 const shouldRetryErrorMock = mock(() => true)
 const getNextFallbackMock = mock((chain: Array<{ model: string }>, attempt: number) => chain[attempt])
 const hasMoreFallbacksMock = mock((chain: Array<{ model: string }>, attempt: number) => attempt < chain.length)
+const isProviderScopedStopMock = mock(() => false)
+const hasCrossProviderFallbackMock = mock(() => false)
 const selectFallbackProviderMock = mock((providers: string[]) => providers[0])
 const transformModelForProviderMock = mock((_provider: string, model: string) => model)
 
@@ -27,6 +29,8 @@ async function importFreshFallbackRetryHandlerModule() {
     shouldRetryError: shouldRetryErrorMock,
     getNextFallback: getNextFallbackMock,
     hasMoreFallbacks: hasMoreFallbacksMock,
+    isProviderScopedStop: isProviderScopedStopMock,
+    hasCrossProviderFallback: hasCrossProviderFallbackMock,
     selectFallbackProvider: selectFallbackProviderMock,
   }))
 
@@ -42,11 +46,19 @@ async function importFreshFallbackRetryHandlerModule() {
     shouldRetryError: shouldRetryErrorMock,
     selectFallbackProvider: selectFallbackProviderMock,
     readProviderModelsCache: readProviderModelsCacheMock,
+    isProviderScopedStop: isProviderScopedStopMock,
+    hasCrossProviderFallback: hasCrossProviderFallbackMock,
   }
 }
 
-const { tryFallbackRetry, shouldRetryError, selectFallbackProvider, readProviderModelsCache } =
-  await importFreshFallbackRetryHandlerModule()
+const {
+  tryFallbackRetry,
+  shouldRetryError,
+  selectFallbackProvider,
+  readProviderModelsCache,
+  isProviderScopedStop,
+  hasCrossProviderFallback,
+} = await importFreshFallbackRetryHandlerModule()
 
 function createDeferredPromise(): {
   promise: Promise<void>
@@ -136,6 +148,8 @@ describe("tryFallbackRetry", () => {
     ;(shouldRetryError as any).mockImplementation(() => true)
     ;(selectFallbackProvider as any).mockImplementation((providers: string[]) => providers[0])
     ;(readProviderModelsCache as any).mockReturnValue(null)
+    ;(isProviderScopedStop as any).mockImplementation(() => false)
+    ;(hasCrossProviderFallback as any).mockImplementation(() => false)
   })
 
   describe("#given retryable error with fallback chain", () => {
@@ -323,6 +337,188 @@ describe("tryFallbackRetry", () => {
     })
   })
 
+  describe("#given task.modelIntent is 'explicit' (sticky-model policy)", () => {
+    test("returns false even when shouldRetryError is true and a fallback chain is available", async () => {
+      // given — user explicitly picked a model (CLI --model / agents.<>.model
+      // override / TeamSpec model:); chain is fully available and the error
+      // is exactly the kind that previously triggered a silent swap.
+      const args = createDefaultArgs({
+        model: { providerID: "deepseek", modelID: "v4-pro" },
+        modelIntent: "explicit",
+        attemptCount: 0,
+      })
+      ;(shouldRetryError as any).mockImplementation(() => true)
+
+      // when
+      const result = await tryFallbackRetry(args)
+
+      // then — the runtime refuses to advance the chain. The task model is
+      // preserved; concurrency is NOT released; no retry is enqueued.
+      expect(result).toBe(false)
+      expect(args.task.model?.modelID).toBe("v4-pro")
+      expect(args.task.model?.providerID).toBe("deepseek")
+      expect(args.task.modelIntent).toBe("explicit")
+      expect(args.task.attemptCount).toBe(0)
+      expect(args.concurrencyManager.release).not.toHaveBeenCalled()
+      expect(args.queuesByKey.size).toBe(0)
+    })
+
+    test("undefined modelIntent is treated as auto and chain advancement still works", async () => {
+      // given — legacy task launched before the modelIntent field existed
+      const args = createDefaultArgs({
+        model: { providerID: "anthropic", modelID: "claude-opus-4-7" },
+        attemptCount: 0,
+      })
+
+      // when
+      const result = await tryFallbackRetry(args)
+
+      // then — backward compat: undefined modelIntent permits chain
+      expect(result).toBe(true)
+    })
+
+    test("modelIntent='auto' permits chain advancement", async () => {
+      // given — system-resolved or category-default model
+      const args = createDefaultArgs({
+        model: { providerID: "anthropic", modelID: "claude-opus-4-7" },
+        modelIntent: "auto",
+        attemptCount: 0,
+      })
+
+      // when
+      const result = await tryFallbackRetry(args)
+
+      // then
+      expect(result).toBe(true)
+    })
+  })
+
+  describe("#given forceCrossProvider mode (sticky cross-provider escape)", () => {
+    test("uses crossProviderProviders as the synthetic provider list, preserves modelID, and re-queues even when modelIntent='explicit' (sticky guard bypassed)", async () => {
+      // given — sticky task whose original provider exhausted balance.
+      // Manager passes the alternate connected provider list.
+      const baseArgs = createDefaultArgs({
+        model: { providerID: "opencode-go", modelID: "deepseek-v4-pro" },
+        modelIntent: "explicit",
+        attemptCount: 0,
+      })
+      const args = {
+        ...baseArgs,
+        forceCrossProvider: true,
+        crossProviderProviders: ["github-copilot"],
+      }
+
+      // when
+      const result = await tryFallbackRetry(args)
+
+      // then — task was re-queued under the alternate provider with the
+      // original modelID preserved. attemptCount stayed at 0 since this
+      // is a provider swap, not a chain advancement.
+      expect(result).toBe(true)
+      expect(args.task.model?.modelID).toBe("deepseek-v4-pro")
+      expect(args.task.model?.providerID).toBe("github-copilot")
+      expect(args.task.attemptCount).toBe(0)
+    })
+
+    test("returns false when crossProviderProviders is empty (no alternate available)", async () => {
+      // given
+      const baseArgs = createDefaultArgs({
+        model: { providerID: "opencode-go", modelID: "deepseek-v4-pro" },
+        modelIntent: "explicit",
+      })
+      const args = { ...baseArgs, forceCrossProvider: true, crossProviderProviders: [] }
+
+      // when
+      const result = await tryFallbackRetry(args)
+
+      // then — caller (manager) will fall through to the structured fail path
+      expect(result).toBe(false)
+    })
+
+    test("two sequential swaps: each retry uses a strictly smaller candidate set as the caller accumulates failedProviders (ping-pong protection)", async () => {
+      // given — first swap: opencode-go fails, alternates are
+      // [github-copilot, anthropic]. The caller (manager) picks the head.
+      const firstSwap = createDefaultArgs({
+        model: { providerID: "opencode-go", modelID: "deepseek-v4-pro" },
+        modelIntent: "explicit",
+        attemptCount: 0,
+      })
+      const firstArgs = {
+        ...firstSwap,
+        forceCrossProvider: true,
+        crossProviderProviders: ["github-copilot", "anthropic"],
+      }
+      await tryFallbackRetry(firstArgs)
+      expect(firstArgs.task.model?.providerID).toBe("github-copilot")
+
+      // when — second swap: github-copilot now ALSO fails. Caller has
+      // accumulated failedProviders=[opencode-go, github-copilot] and
+      // hands us only [anthropic] — i.e. github-copilot is excluded so
+      // we cannot ping-pong back to it.
+      const secondArgs = {
+        ...firstArgs,
+        crossProviderProviders: ["anthropic"],
+      }
+      const result = await tryFallbackRetry(secondArgs)
+
+      // then
+      expect(result).toBe(true)
+      expect(secondArgs.task.model?.providerID).toBe("anthropic")
+      expect(secondArgs.task.model?.modelID).toBe("deepseek-v4-pro")
+      // Critically: NEVER returns to opencode-go or github-copilot.
+      expect(["opencode-go", "github-copilot"]).not.toContain(secondArgs.task.model?.providerID)
+    })
+
+    test("exhausted alternates: empty crossProviderProviders falls through to false so the manager triggers structured fail-with-billing-URL", async () => {
+      // given — every connected provider has been added to failedProviders.
+      // The manager hands us an empty list. The function must return false
+      // so the caller falls into the structured-fail path (Step 2 in
+      // manager.handleSessionErrorEvent).
+      const args = createDefaultArgs({
+        model: { providerID: "opencode-go", modelID: "deepseek-v4-pro" },
+        modelIntent: "explicit",
+      })
+      const exhaustedArgs = {
+        ...args,
+        forceCrossProvider: true,
+        crossProviderProviders: [],
+      }
+
+      // when
+      const result = await tryFallbackRetry(exhaustedArgs)
+
+      // then — caller will surface [STICKY MODEL UNAVAILABLE] reminder
+      expect(result).toBe(false)
+      // And task.model is unchanged (no swap happened).
+      expect(exhaustedArgs.task.model?.providerID).toBe("opencode-go")
+    })
+
+    test("does NOT advance the chain when forceCrossProvider succeeds (synthetic-entry path is independent of fallbackChain)", async () => {
+      // given — sticky task with a real chain, but cross-provider escape
+      // should NOT walk that chain (it would change the model, violating
+      // sticky-on-model intent). The chain stays intact for any subsequent
+      // failures.
+      const baseArgs = createDefaultArgs({
+        model: { providerID: "opencode-go", modelID: "claude-opus-4-7" },
+        modelIntent: "explicit",
+        attemptCount: 0,
+      })
+      const originalChainLength = baseArgs.task.fallbackChain?.length ?? 0
+      const args = {
+        ...baseArgs,
+        forceCrossProvider: true,
+        crossProviderProviders: ["anthropic", "github-copilot"],
+      }
+
+      // when
+      await tryFallbackRetry(args)
+
+      // then
+      expect(args.task.fallbackChain?.length).toBe(originalChainLength)
+      expect(args.task.attemptCount).toBe(0)
+    })
+  })
+
   describe("#given no fallback chain", () => {
     test("returns false when fallbackChain is undefined", async () => {
       const args = createDefaultArgs({ fallbackChain: undefined })
@@ -430,6 +626,78 @@ describe("tryFallbackRetry", () => {
       expect(result).toBe(true)
       expect(args.task.model?.providerID).toBe("provider-a")
       expect(args.task.model?.modelID).toBe("fallback-model-1")
+    })
+  })
+
+  describe("#given provider-scoped stop with cross-provider chain (Copilot balance runout case)", () => {
+    test("retries on a different-provider entry even though shouldRetryError says false", async () => {
+      ;(shouldRetryError as any).mockImplementation(() => false)
+      ;(isProviderScopedStop as any).mockImplementation(() => true)
+      ;(hasCrossProviderFallback as any).mockImplementation(() => true)
+
+      const args = createDefaultArgs({
+        fallbackChain: [
+          { model: "fallback-model-1", providers: ["provider-b"], variant: undefined },
+        ],
+        model: { providerID: "provider-a", modelID: "original-model" },
+        attemptCount: 0,
+      })
+      args.errorInfo = { name: "InsufficientCreditsError", message: "402 insufficient balance" }
+
+      const result = await tryFallbackRetry(args)
+
+      expect(result).toBe(true)
+      expect(args.task.model?.providerID).toBe("provider-b")
+      expect(args.task.model?.modelID).toBe("fallback-model-1")
+    })
+
+    test("does NOT retry when chain is exhausted of cross-provider entries", async () => {
+      ;(shouldRetryError as any).mockImplementation(() => false)
+      ;(isProviderScopedStop as any).mockImplementation(() => true)
+      ;(hasCrossProviderFallback as any).mockImplementation(() => false)
+
+      const args = createDefaultArgs({
+        fallbackChain: [
+          { model: "same-prov-fallback", providers: ["provider-a"], variant: undefined },
+        ],
+        model: { providerID: "provider-a", modelID: "original-model" },
+      })
+      args.errorInfo = { name: "InsufficientCreditsError", message: "out of credits" }
+
+      const result = await tryFallbackRetry(args)
+
+      expect(result).toBe(false)
+    })
+
+    test("does NOT retry on user-fault errors even with a cross-provider chain", async () => {
+      // PermissionDenied is non-retryable AND non-stop; cross-provider escape
+      // must not rescue it.
+      ;(shouldRetryError as any).mockImplementation(() => false)
+      ;(isProviderScopedStop as any).mockImplementation(() => false)
+      ;(hasCrossProviderFallback as any).mockImplementation(() => true)
+
+      const args = createDefaultArgs()
+      args.errorInfo = { name: "PermissionDeniedError", message: "denied by user" }
+
+      const result = await tryFallbackRetry(args)
+
+      expect(result).toBe(false)
+    })
+
+    test("baseRetry takes precedence (does not double-call cross-provider gate)", async () => {
+      ;(shouldRetryError as any).mockImplementation(() => true)
+      const isStopSpy = mock(() => true)
+      const hasCrossSpy = mock(() => true)
+      ;(isProviderScopedStop as any).mockImplementation(isStopSpy)
+      ;(hasCrossProviderFallback as any).mockImplementation(hasCrossSpy)
+
+      const args = createDefaultArgs()
+      const result = await tryFallbackRetry(args)
+
+      expect(result).toBe(true)
+      // The escape gate is short-circuited when baseRetry is already true.
+      expect(isStopSpy).not.toHaveBeenCalled()
+      expect(hasCrossSpy).not.toHaveBeenCalled()
     })
   })
 })

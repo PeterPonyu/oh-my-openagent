@@ -53,9 +53,10 @@ const RETRYABLE_MESSAGE_PATTERNS = [
   "bad request",
   "unknown provider",
   "provider not found",
-  "model_not_supported",
-  "model not supported",
-  "model is not supported",
+  // model_not_supported / "model not supported" intentionally moved to
+  // STOP_MESSAGE_PATTERNS — same provider will not start serving the
+  // model on retry, so escape to a different provider is the right
+  // recovery, not a same-provider retry.
   "connection error",
   "network error",
   "timeout",
@@ -77,8 +78,16 @@ const RETRYABLE_MESSAGE_PATTERNS = [
 ]
 
 /**
- * Message patterns that indicate a non-retryable STOP error (quota/billing exhaustion).
- * These take precedence over RETRYABLE_MESSAGE_PATTERNS.
+ * Message patterns that indicate a non-retryable STOP error — the failing
+ * provider definitively cannot serve this request, but a DIFFERENT
+ * provider may. Covers two semantically equivalent cases for routing:
+ *   - billing/quota exhaustion ("insufficient balance", "out of credits", etc.)
+ *   - model unavailability on this provider ("model_not_supported")
+ * STOP takes precedence over RETRYABLE_MESSAGE_PATTERNS, so adding model-
+ * unavailability here flips the runtime from "retry same provider/model
+ * forever" (the loop the user reported on github-copilot/claude-opus-4.5)
+ * to "this provider can't help; surface to manager which fires sticky
+ * cross-provider escape or auto-mode crossProviderEscape".
  */
 const STOP_MESSAGE_PATTERNS = [
   "quota will reset after",
@@ -99,6 +108,13 @@ const STOP_MESSAGE_PATTERNS = [
   "credit balance",
   "usage limit for this month",
   "exhausted your capacity",
+  // Model unavailability on the failing provider — semantically a "stop"
+  // because retrying on the same provider with the same model will return
+  // the same error. Different provider may serve this model.
+  "model_not_supported",
+  "model not supported",
+  "model is not supported",
+  "the requested model is not supported",
 ]
 
 const AUTO_RETRY_GATE_PATTERNS = [
@@ -114,6 +130,34 @@ function hasProviderAutoRetrySignal(message: string): boolean {
   return AUTO_RETRY_GATE_PATTERNS.some((pattern) => message.includes(pattern))
 }
 
+/**
+ * SDK transport-layer error patterns. These surface as `SyntaxError` /
+ * `JsonParseError` from streaming response decoders when the SSE stream is
+ * truncated mid-token (provider connection drop, buffer overrun, partial
+ * tool-call delta) — NOT real syntax errors in user code. Matching these
+ * patterns must override the `SyntaxError` non-retryable name lookup so
+ * the runtime can retry the same model on a fresh stream rather than fail
+ * the task permanently. Observed in the team-mode audit failure where the
+ * member's first turn died with `JSON Parse error: Unterminated string`
+ * and the queued team_send_message prompts were stranded.
+ */
+const TRANSPORT_ERROR_MESSAGE_PATTERNS = [
+  "json parse error",
+  "unterminated string",
+  "unexpected end of stream",
+  "unexpected end of json",
+  "stream closed",
+  "premature close",
+  "socket hang up",
+  "econnreset",
+  "etimedout",
+]
+
+function hasTransportError(message: string): boolean {
+  if (!message) return false
+  return TRANSPORT_ERROR_MESSAGE_PATTERNS.some((pattern) => message.includes(pattern))
+}
+
 export interface ErrorInfo {
   name?: string
   message?: string
@@ -124,6 +168,16 @@ export interface ErrorInfo {
  * Returns true if it's a known retryable type OR matches retryable message patterns.
  */
 export function isRetryableModelError(error: ErrorInfo): boolean {
+  const msg = error.message?.toLowerCase() ?? ""
+
+  // SDK transport blip — overrides the non-retryable name lookup. Stream
+  // truncation surfaces as `SyntaxError` from the JSON decoder but is a
+  // network event, not a code error. Without this short-circuit, an
+  // `Unterminated string` aborts the task permanently.
+  if (hasTransportError(msg)) {
+    return true
+  }
+
   // If we have an error name, check against known lists
   if (error.name) {
     const errorNameLower = error.name.toLowerCase()
@@ -139,9 +193,6 @@ export function isRetryableModelError(error: ErrorInfo): boolean {
       return true
     }
   }
-
-  // Check message patterns for unknown errors
-  const msg = error.message?.toLowerCase() ?? ""
 
   // STOP patterns take precedence over retryable patterns
   if (STOP_MESSAGE_PATTERNS.some((pattern) => msg.includes(pattern))) {
@@ -160,6 +211,51 @@ export function isRetryableModelError(error: ErrorInfo): boolean {
  */
 export function shouldRetryError(error: ErrorInfo): boolean {
   return isRetryableModelError(error)
+}
+
+/**
+ * Determines if an error is a provider-scoped stop signal (the failing
+ * provider has run out of capacity / credits / quota for this account, but
+ * the user's other providers may still be reachable). Used by the fallback
+ * handler to allow cross-provider escape: when the message says "insufficient
+ * balance" on copilot but the chain offers an opencode-go entry, that entry
+ * has its own balance pool and is worth trying.
+ *
+ * Returns false for user-fault errors (permission, validation, etc.) and for
+ * generic retryable errors (rate_limit) which `shouldRetryError` already
+ * covers via the standard chain.
+ */
+export function isProviderScopedStop(error: ErrorInfo): boolean {
+  if (error.name) {
+    const errorNameLower = error.name.toLowerCase()
+    if (NON_RETRYABLE_ERROR_NAMES.has(errorNameLower)) return false
+    if (STOP_ERROR_NAMES.has(errorNameLower)) return true
+  }
+  const msg = error.message?.toLowerCase() ?? ""
+  if (!msg) return false
+  return STOP_MESSAGE_PATTERNS.some((pattern) => msg.includes(pattern))
+}
+
+/**
+ * True iff at least one fallback entry from `attemptCount` onward names a
+ * provider different from `failingProviderID`. Used by the fallback handler
+ * to decide whether a provider-scoped stop is worth retrying.
+ */
+export function hasCrossProviderFallback(
+  chain: FallbackEntry[],
+  attemptCount: number,
+  failingProviderID: string | undefined,
+): boolean {
+  if (!failingProviderID) return false
+  const failing = failingProviderID.toLowerCase()
+  for (let i = Math.max(0, attemptCount); i < chain.length; i++) {
+    const entry = chain[i]
+    if (!entry) continue
+    if (entry.providers.some((p) => p.toLowerCase() !== failing)) {
+      return true
+    }
+  }
+  return false
 }
 
 /**

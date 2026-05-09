@@ -10,11 +10,11 @@ import { lookupTeamSession } from "../team-session-registry"
 import { loadRuntimeState } from "../team-state-store/store"
 import { buildEnvelope } from "../team-mailbox/poll"
 import {
-  commitDeliveryReservation,
   releaseDeliveryReservation,
   reserveMessageForDelivery,
 } from "../team-mailbox/reservation"
 import { BroadcastNotPermittedError, sendMessage } from "../team-mailbox/send"
+import { transitionRuntimeState } from "../team-state-store/store"
 
 import type { Message } from "../types"
 import { MessageSchema } from "../types"
@@ -88,31 +88,31 @@ async function resolveTeamRuntimeDetails(
     }
   }
 
-  try {
-    const runtimeState = await deps.loadRuntimeState(teamRunId, config)
-    const isLead = runtimeState.leadSessionId === sessionID
-    const leadMember = isLead
-      ? runtimeState.members.find((member) => member.agentType === "leader")
-      : undefined
-    const member = runtimeState.members.find((entry) => entry.sessionId === sessionID)
-    const senderName = leadMember?.name ?? member?.name ?? "unknown"
-
-    return {
-      teamRunId: runtimeState.teamRunId,
-      isLead,
-      senderName,
-      activeMembers: runtimeState.members
-        .map((entry) => entry.name)
-        .filter((name) => name !== senderName),
-    }
-  } catch {
-    return {
-      teamRunId,
-      isLead: false,
-      senderName: "unknown",
-      activeMembers: [],
-    }
+  const runtimeState = await deps.loadRuntimeState(teamRunId, config)
+  const isLead = runtimeState.leadSessionId === sessionID
+  const leadMember = isLead
+    ? runtimeState.members.find((member) => member.agentType === "leader")
+    : undefined
+  const member = runtimeState.members.find((entry) => entry.sessionId === sessionID)
+  const senderName = leadMember?.name ?? member?.name
+  if (!senderName) {
+    throw new Error(`team participant not found for session ${sessionID}`)
   }
+
+  return {
+    teamRunId: runtimeState.teamRunId,
+    isLead,
+    senderName,
+    activeMembers: runtimeState.members
+      .map((entry) => entry.name)
+      .filter((name) => name !== senderName),
+  }
+}
+
+function assertRecipientExists(message: Message, memberNames: Set<string>): void {
+  if (message.to === "*") return
+  if (memberNames.has(message.to)) return
+  throw new Error(`team recipient '${message.to}' does not exist`)
 }
 
 async function releaseReservationSafely(
@@ -185,8 +185,28 @@ async function deliverLive(
         body: buildMemberPromptBody(recipientMember, envelope),
         query: { directory: recipientMember.worktreePath ?? directory },
       })
-      await commitDeliveryReservation(reservation)
-      log("[team-mailbox] live delivery committed", {
+      // Defer the commit. promptAsync returns when the SDK has enqueued the
+      // request, not when the recipient session has actually run the turn —
+      // if the recipient is stuck (e.g., its prior turn crashed mid-stream),
+      // a premature commit would move the inbox file into processed/ and
+      // strand the message. Instead: release the reservation back to the
+      // inbox, mark the messageId as live-delivered via
+      // pendingInjectedMessageIds, and let the next legitimate touch
+      // (team-mailbox-injector dedupe + team-idle-wake-hint ack) finalize
+      // the lifecycle.
+      await releaseDeliveryReservation(reservation)
+      await transitionRuntimeState(teamRunId, (currentState) => ({
+        ...currentState,
+        members: currentState.members.map((member) => member.name === recipientName
+          ? {
+              ...member,
+              pendingInjectedMessageIds: Array.from(
+                new Set([...member.pendingInjectedMessageIds, message.messageId]),
+              ),
+            }
+          : member),
+      }), config)
+      log("[team-mailbox] live delivery enqueued (deferred commit)", {
         teamRunId,
         recipient: recipientName,
         recipientSessionId,
@@ -212,6 +232,7 @@ export function createTeamSendMessageTool(
   config: TeamModeConfig,
   client: LiveDeliveryClient,
   deps: TeamSendMessageToolDeps = defaultTeamSendMessageToolDeps,
+  getCurrentServerUrl?: () => string | undefined,
 ): ToolDefinition {
   return tool({
     description: "Send a message to a team member or broadcast to the team.",
@@ -261,6 +282,10 @@ export function createTeamSendMessageTool(
       }
 
       const runtimeState = await deps.loadRuntimeState(teamRuntime.teamRunId, config)
+      const { assertTeamServedByCurrentInstance } = await import("../team-state-store/store")
+      await assertTeamServedByCurrentInstance(runtimeState, getCurrentServerUrl?.())
+      const memberNames = new Set(runtimeState.members.map((member) => member.name))
+      assertRecipientExists(message, memberNames)
       const reservedRecipients = new Set<string>(
         runtimeState.members
           .filter((member) => member.sessionId !== undefined && member.name !== teamRuntime.senderName)
