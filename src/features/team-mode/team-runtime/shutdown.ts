@@ -10,37 +10,17 @@ import {
 } from "./shutdown-helpers"
 export { deleteTeam } from "./delete-team"
 
-export type ShutdownActor = {
-  memberName: string
-  role: "lead" | "member"
-}
-
-function assertShutdownRequester(actor: ShutdownActor): void {
-  if (actor.role !== "lead") {
-    throw new Error("team_shutdown_request is lead-only")
-  }
-}
-
-function assertShutdownResponder(actor: ShutdownActor, targetMemberName: string): void {
-  if (actor.role === "lead" || actor.memberName === targetMemberName) {
-    return
-  }
-
-  throw new Error("caller must be target member or team lead")
-}
-
 export async function requestShutdownOfMember(
   teamRunId: string,
   targetMemberName: string,
-  actor: ShutdownActor,
+  requesterName: string,
   config: TeamModeConfig,
 ): Promise<void> {
   const runtimeState = await loadRuntimeState(teamRunId, config)
-  assertShutdownRequester(actor)
   getRuntimeMember(runtimeState, targetMemberName)
-  getRuntimeMember(runtimeState, actor.memberName)
+  getRuntimeMember(runtimeState, requesterName)
 
-  const existingRequestIndex = findLatestShutdownRequestIndex(runtimeState, targetMemberName, actor.memberName)
+  const existingRequestIndex = findLatestShutdownRequestIndex(runtimeState, targetMemberName, requesterName)
   const existingRequest = existingRequestIndex >= 0
     ? runtimeState.shutdownRequests[existingRequestIndex]
     : undefined
@@ -49,18 +29,14 @@ export async function requestShutdownOfMember(
   }
 
   await sendMessage(
-    createShutdownMessage(actor.memberName, targetMemberName, "shutdown_request", ""),
+    createShutdownMessage(requesterName, targetMemberName, "shutdown_request", ""),
     teamRunId,
     config,
-    createSendContext(runtimeState, actor.memberName),
+    createSendContext(runtimeState, requesterName),
   )
 
   await transitionRuntimeState(teamRunId, (currentRuntimeState) => {
-    assertShutdownRequester(actor)
-    getRuntimeMember(currentRuntimeState, targetMemberName)
-    getRuntimeMember(currentRuntimeState, actor.memberName)
-
-    const duplicateRequestIndex = findLatestShutdownRequestIndex(currentRuntimeState, targetMemberName, actor.memberName)
+    const duplicateRequestIndex = findLatestShutdownRequestIndex(currentRuntimeState, targetMemberName, requesterName)
     const duplicateRequest = duplicateRequestIndex >= 0
       ? currentRuntimeState.shutdownRequests[duplicateRequestIndex]
       : undefined
@@ -72,7 +48,7 @@ export async function requestShutdownOfMember(
       ...currentRuntimeState,
       shutdownRequests: [
         ...currentRuntimeState.shutdownRequests,
-        { memberId: targetMemberName, requesterName: actor.memberName, requestedAt: Date.now() },
+        { memberId: targetMemberName, requesterName, requestedAt: Date.now() },
       ],
     }
   }, config)
@@ -81,12 +57,11 @@ export async function requestShutdownOfMember(
 export async function approveShutdown(
   teamRunId: string,
   memberName: string,
-  actor: ShutdownActor,
+  approverName: string,
   config: TeamModeConfig,
 ): Promise<void> {
   const runtimeState = await loadRuntimeState(teamRunId, config)
-  assertShutdownResponder(actor, memberName)
-  getRuntimeMember(runtimeState, actor.memberName)
+  getRuntimeMember(runtimeState, approverName)
   const shutdownRequestIndex = findLatestShutdownRequestIndex(runtimeState, memberName)
   if (shutdownRequestIndex < 0) {
     throw new Error(`shutdown request missing for '${memberName}'`)
@@ -98,9 +73,6 @@ export async function approveShutdown(
   }
 
   const updatedRuntimeState = await transitionRuntimeState(teamRunId, (currentRuntimeState) => {
-    assertShutdownResponder(actor, memberName)
-    getRuntimeMember(currentRuntimeState, actor.memberName)
-
     const currentRequestIndex = findLatestShutdownRequestIndex(currentRuntimeState, memberName)
     if (currentRequestIndex < 0) {
       throw new Error(`shutdown request missing for '${memberName}'`)
@@ -127,10 +99,10 @@ export async function approveShutdown(
   }, config)
 
   await sendMessage(
-    createShutdownMessage(actor.memberName, getLeadMemberName(updatedRuntimeState), "shutdown_approved", memberName),
+    createShutdownMessage(approverName, getLeadMemberName(updatedRuntimeState), "shutdown_approved", memberName),
     teamRunId,
     config,
-    createSendContext(updatedRuntimeState, actor.memberName),
+    createSendContext(updatedRuntimeState, approverName),
   )
 }
 
@@ -138,12 +110,9 @@ export async function rejectShutdown(
   teamRunId: string,
   memberName: string,
   reason: string,
-  actor: ShutdownActor,
   config: TeamModeConfig,
 ): Promise<void> {
   const runtimeState = await loadRuntimeState(teamRunId, config)
-  assertShutdownResponder(actor, memberName)
-  getRuntimeMember(runtimeState, actor.memberName)
   const shutdownRequestIndex = findLatestShutdownRequestIndex(runtimeState, memberName)
   if (shutdownRequestIndex < 0) {
     throw new Error(`shutdown request missing for '${memberName}'`)
@@ -155,16 +124,13 @@ export async function rejectShutdown(
   }
 
   await sendMessage(
-    createShutdownMessage(actor.memberName, shutdownRequest.requesterName, "shutdown_rejected", reason),
+    createShutdownMessage(memberName, shutdownRequest.requesterName, "shutdown_rejected", reason),
     teamRunId,
     config,
-    createSendContext(runtimeState, actor.memberName),
+    createSendContext(runtimeState, memberName),
   )
 
   await transitionRuntimeState(teamRunId, (currentRuntimeState) => {
-    assertShutdownResponder(actor, memberName)
-    getRuntimeMember(currentRuntimeState, actor.memberName)
-
     const currentRequestIndex = findLatestShutdownRequestIndex(currentRuntimeState, memberName)
     if (currentRequestIndex < 0) {
       throw new Error(`shutdown request missing for '${memberName}'`)
