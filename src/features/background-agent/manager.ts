@@ -17,8 +17,6 @@ import {
   promptWithModelSuggestionRetry,
   resolveInheritedPromptTools,
   createInternalAgentTextPart,
-  readConnectedProvidersCache,
-  readProviderModelsCache,
 } from "../../shared"
 import { applySessionPromptParams } from "../../shared/session-prompt-params-helpers"
 import { setSessionTools } from "../../shared/session-tools-store"
@@ -29,7 +27,6 @@ import { isInsideTmux } from "../../shared/tmux"
 import {
   shouldRetryError,
   hasMoreFallbacks,
-  isProviderScopedStop,
 } from "../../shared/model-error-classifier"
 import {
   POLLING_INTERVAL_MS,
@@ -91,8 +88,25 @@ import {
   resolveSubagentSpawnContext,
   type SubagentSpawnContext,
 } from "./subagent-spawn-limits"
+import { settleAfterSessionIdle } from "../../hooks/shared/session-idle-settle"
 
 type OpencodeClient = PluginInput["client"]
+
+type ParentWakePromptContext = {
+  agent?: string
+  model?: { providerID: string; modelID: string }
+  variant?: string
+  tools?: Record<string, boolean>
+}
+
+type SessionStatusInfo = { type?: string }
+
+const BACKGROUND_PARENT_WAKE_PROMPT = `<system-reminder>
+[BACKGROUND TASK NOTIFICATION READY]
+A background task notification was already added to this session. Continue from that notification.
+</system-reminder>`
+
+const PENDING_PARENT_WAKE_RETRY_MS = 1_000
 
 interface MessagePartInfo {
   id?: string
@@ -162,12 +176,9 @@ function cloneAttempts(task: BackgroundTask): BackgroundTaskAttempt[] | undefine
   return task.attempts.map((attempt) => ({ ...attempt }))
 }
 
-function buildLocalSessionUrl(serverOrigin: string, directory: string, sessionID: string): string {
+function buildLocalSessionUrl(directory: string, sessionID: string): string {
   const encodedDirectory = Buffer.from(directory).toString("base64url")
-  // serverOrigin already includes scheme://host:port — strip any trailing slash
-  // before composing the path to avoid `//` in the result.
-  const trimmed = serverOrigin.endsWith("/") ? serverOrigin.slice(0, -1) : serverOrigin
-  return `${trimmed}/${encodedDirectory}/session/${sessionID}`
+  return `http://127.0.0.1:4096/${encodedDirectory}/session/${sessionID}`
 }
 
 export interface SubagentSessionCreatedEvent {
@@ -179,6 +190,7 @@ export interface SubagentSessionCreatedEvent {
 export type OnSubagentSessionCreated = (event: SubagentSessionCreatedEvent) => Promise<void>
 
 const MAX_TASK_REMOVAL_RESCHEDULES = 6
+const MAX_COMPLETED_TASK_ARCHIVE_SIZE = 100
 
 export interface BackgroundManagerConfig {
   pluginContext: PluginInput
@@ -201,12 +213,6 @@ export class BackgroundManager {
   private pendingByParent: Map<string, Set<string>>  // Track pending tasks per parent for batching
   private client: OpencodeClient
   private directory: string
-  // Lazy reader for the live server URL — opencode's `ctx.serverUrl` is a
-  // getter that returns a localhost:4096 placeholder while Server.url is
-  // null and the real URL once the server has bound. Snapshotting it in
-  // the constructor would freeze the placeholder; reading on demand always
-  // sees the current value.
-  private readonly readServerOrigin: () => string
   private pollingInterval?: ReturnType<typeof setInterval>
   private pollingInFlight = false
   private concurrencyManager: ConcurrencyManager
@@ -219,17 +225,12 @@ export class BackgroundManager {
   private queuesByKey: Map<string, QueueItem[]> = new Map()
   private processingKeys: Set<string> = new Set()
   private completionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+  private completedTaskArchive: Map<string, BackgroundTask> = new Map()
   private completedTaskSummaries: Map<string, BackgroundTaskNotificationTask[]> = new Map()
   private idleDeferralTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
   private notificationQueueByParent: Map<string, Promise<void>> = new Map()
-  // Per-task serialization of handleSessionErrorEvent. Concurrent
-  // session.error events for the same task (rare but possible during
-  // global provider outages) would otherwise race on task.failedProviders
-  // and double-fire the cross-provider escape — both observers seeing
-  // the SAME failed-provider snapshot, both swapping to the same
-  // alternate, both calling scheduleRetryAttempt. Chaining error events
-  // per task ensures the second event sees the first's mutations.
-  private sessionErrorChainByTask: Map<string, Promise<void>> = new Map()
+  private pendingParentWakes: Map<string, ParentWakePromptContext> = new Map()
+  private pendingParentWakeTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
   private observedOutputSessions: Set<string> = new Set()
   private observedIncompleteTodosBySession: Map<string, boolean> = new Map()
   private rootDescendantCounts: Map<string, number>
@@ -250,15 +251,6 @@ export class BackgroundManager {
     this.pendingByParent = new Map()
     this.client = pluginContext.client
     this.directory = pluginContext.directory
-    this.readServerOrigin = () => {
-      const url = pluginContext.serverUrl
-      if (!url) return "http://127.0.0.1:4096"
-      try {
-        return new URL(url.toString()).origin
-      } catch {
-        return "http://127.0.0.1:4096"
-      }
-    }
     this.concurrencyManager = new ConcurrencyManager(options.config)
     this.config = options.config
     this.tmuxEnabled = options?.tmuxConfig?.enabled ?? false
@@ -360,6 +352,7 @@ export class BackgroundManager {
   }
 
   private addTask(task: BackgroundTask): void {
+    this.completedTaskArchive.delete(task.id)
     this.tasks.set(task.id, task)
     if (!task.parentSessionId) {
       return
@@ -371,8 +364,45 @@ export class BackgroundManager {
   }
 
   private removeTask(task: BackgroundTask): void {
+    this.archiveCompletedTask(task)
     this.tasks.delete(task.id)
     this.removeTaskFromParentIndex(task.id, task.parentSessionId)
+  }
+
+  private archiveCompletedTask(task: BackgroundTask): void {
+    if (!task.sessionId) {
+      return
+    }
+    if (task.status === "running" || task.status === "pending") {
+      return
+    }
+
+    const archivedTask: BackgroundTask = {
+      id: task.id,
+      parentSessionId: task.parentSessionId,
+      parentMessageId: task.parentMessageId,
+      description: task.description,
+      prompt: "[redacted]",
+      agent: task.agent,
+      sessionId: task.sessionId,
+      status: task.status,
+      queuedAt: task.queuedAt,
+      startedAt: task.startedAt,
+      completedAt: task.completedAt,
+      model: task.model,
+      error: task.error,
+      category: task.category,
+    }
+
+    this.completedTaskArchive.set(task.id, archivedTask)
+    if (this.completedTaskArchive.size <= MAX_COMPLETED_TASK_ARCHIVE_SIZE) {
+      return
+    }
+
+    const oldestTaskID = this.completedTaskArchive.keys().next().value
+    if (typeof oldestTaskID === "string") {
+      this.completedTaskArchive.delete(oldestTaskID)
+    }
   }
 
   private updateTaskParent(task: BackgroundTask, parentSessionID: string): void {
@@ -450,10 +480,10 @@ export class BackgroundManager {
         parentAgent: input.parentAgent,
         parentTools: input.parentTools,
         model: input.model,
-        modelIntent: input.modelIntent,
         fallbackChain: input.fallbackChain,
         attemptCount: 0,
         category: input.category,
+        onSessionCreated: input.onSessionCreated,
       }
       const firstAttempt = startAttempt(task, input.model)
 
@@ -678,7 +708,7 @@ export class BackgroundManager {
 
     if (task.retryNotification) {
       const attemptNumber = boundAttempt.attemptNumber
-      const retrySessionUrl = buildLocalSessionUrl(this.readServerOrigin(), parentDirectory, sessionID)
+      const retrySessionUrl = buildLocalSessionUrl(parentDirectory, sessionID)
       const previousAttempt = getPreviousAttempt(task, boundAttempt.attemptId)
       const failedSessionID = previousAttempt?.sessionId ?? task.retryNotification.previousSessionID
       const failedSessionLine = failedSessionID
@@ -752,7 +782,9 @@ The fallback retry session is now created and can be inspected directly.
           task: false,
           call_omo_agent: true,
           question: false,
-          ...getAgentToolRestrictions(input.agent),
+          ...getAgentToolRestrictions(input.agent, {
+            includeTeamToolDenylist: input.teamRunId === undefined,
+          }),
         }
         setSessionTools(sessionID, tools)
         return tools
@@ -772,7 +804,9 @@ The fallback retry session is now created and can be inspected directly.
           taskId: task.id,
         })
         try {
-          const fallbackBody = buildFallbackBody(promptBody, FALLBACK_AGENT)
+          const fallbackBody = buildFallbackBody(promptBody, FALLBACK_AGENT, {
+            includeTeamToolDenylist: input.teamRunId === undefined,
+          })
           setSessionTools(sessionID, fallbackBody.tools as Record<string, boolean>)
           await promptWithModelSuggestionRetry(this.client, {
             path: { id: sessionID },
@@ -839,7 +873,7 @@ The fallback retry session is now created and can be inspected directly.
   }
 
   getTask(id: string): BackgroundTask | undefined {
-    return this.tasks.get(id)
+    return this.tasks.get(id) ?? this.completedTaskArchive.get(id)
   }
 
   getTasksByParentSession(sessionID: string): BackgroundTask[] {
@@ -1133,7 +1167,9 @@ The fallback retry session is now created and can be inspected directly.
             task: false,
             call_omo_agent: true,
             question: false,
-            ...getAgentToolRestrictions(existingTask.agent),
+            ...getAgentToolRestrictions(existingTask.agent, {
+              includeTeamToolDenylist: existingTask.teamRunId === undefined,
+            }),
           }
           setSessionTools(existingTask.sessionId!, tools)
           return tools
@@ -1383,6 +1419,12 @@ The fallback retry session is now created and can be inspected directly.
 
     if (event.type === "session.idle") {
       if (!props || typeof props !== "object") return
+      const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined
+      if (sessionID) {
+        void this.enqueueNotificationForParent(sessionID, () => this.flushPendingParentWake(sessionID)).catch((error) => {
+          log("[background-agent] Failed to flush pending parent wake:", { sessionID, error })
+        })
+      }
       handleSessionIdleBackgroundEvent({
         properties: props as Record<string, unknown>,
         findBySession: (id) => {
@@ -1412,8 +1454,7 @@ The fallback retry session is now created and can be inspected directly.
       const errorMessage = props ? getSessionErrorMessage(props) : undefined
 
       const errorInfo = { name: errorName, message: errorMessage }
-      const previousChain = this.sessionErrorChainByTask.get(task.id)
-      const handlerInvocation = (): Promise<void> => this.handleSessionErrorEvent({
+      void this.handleSessionErrorEvent({
         errorInfo,
         errorMessage,
         errorName,
@@ -1423,22 +1464,6 @@ The fallback retry session is now created and can be inspected directly.
           error,
           taskId: task.id,
         })
-      })
-      // Fast-path when no in-flight handler for this task: invoke
-      // synchronously up to the first await, matching the original
-      // void-call timing. Slow-path chains onto the in-flight promise to
-      // serialize concurrent session.error events for the same task and
-      // protect task.failedProviders from a TOCTOU race.
-      const nextChain = previousChain
-        ? previousChain.then(handlerInvocation)
-        : handlerInvocation()
-      this.sessionErrorChainByTask.set(task.id, nextChain)
-      // Cleanup: drop the entry once this dispatch is the chain head.
-      // Without cleanup the Map grows unboundedly across long sessions.
-      void nextChain.finally(() => {
-        if (this.sessionErrorChainByTask.get(task.id) === nextChain) {
-          this.sessionErrorChainByTask.delete(task.id)
-        }
       })
       return
     }
@@ -1567,105 +1592,16 @@ The fallback retry session is now created and can be inspected directly.
       canRetry,
     })
 
-    // Sticky-model + provider-scoped-stop = the user pinned a model and
-    // the provider returned an out-of-credits / insufficient-balance /
-    // quota-exceeded error. Two-step recovery, in order:
-    //
-    //   1. **Cross-provider escape** — pin the modelID, swap providerID.
-    //      If another connected provider exists (e.g. github-copilot when
-    //      opencode-go ran out of balance), re-launch the task on that
-    //      provider with the SAME modelID. Sticky-on-model is honored;
-    //      only the provider changes. The user's work continues.
-    //   2. **Structured fail** — if no alternate provider is connected,
-    //      surface a <system-reminder> with the billing URL from the
-    //      original error and finalize the task as errored. Looping
-    //      forever on a permanently-broken provider is worse than
-    //      surfacing a clear "fix this" message.
-    //
-    // Transient errors (5xx, rate limits) skip both branches and fall
-    // through to the session-alive transparent-retry guard below.
-    const isStickyDefinitiveFailure =
-      task.modelIntent === "explicit" && isProviderScopedStop(errorInfo)
-    if (isStickyDefinitiveFailure) {
-      const requestedModel = task.model
-        ? `${task.model.providerID}/${task.model.modelID}`
-        : "<unknown>"
-
-      // Step 1: try same-model cross-provider escape.
-      if (task.model) {
-        const providerModelsCache = readProviderModelsCache()
-        const connectedProviders = providerModelsCache?.connected ?? readConnectedProvidersCache()
-        const failingProvider = task.model.providerID.toLowerCase()
-        // Persist the failing provider so subsequent stop-errors on this
-        // task can't ping-pong back to it (the escape exclusion list
-        // accumulates across multiple swaps).
-        const previouslyFailed = new Set<string>(
-          (task.failedProviders ?? []).map((provider: string) => provider.toLowerCase()),
-        )
-        previouslyFailed.add(failingProvider)
-        task.failedProviders = Array.from(previouslyFailed)
-        const altProviders: string[] = (connectedProviders ?? [])
-          .filter((provider: string) => !previouslyFailed.has(provider.toLowerCase()))
-        if (altProviders.length > 0) {
-          const swapped = await this.tryFallbackRetry(
-            task,
-            errorInfo,
-            "sticky-cross-provider-escape",
-            { forceCrossProvider: true, crossProviderProviders: altProviders },
-          )
-          if (swapped) {
-            this.queuePendingNotification(
-              task.parentSessionId,
-              [
-                `[PROVIDER SWAP: ${task.model.providerID} → ${altProviders[0]}]`,
-                `Model preserved: ${task.model.modelID} (sticky-on-model intent honored)`,
-                `Reason: ${errorName ?? "provider stop"} — ${errorMsg.slice(0, 200)}`,
-                `If the new provider also lacks this model the task will surface an unavailability error on the next failure.`,
-              ].join("\n"),
-            )
-            log("[background-agent] sticky cross-provider escape succeeded", {
-              taskId: task.id,
-              previousProvider: task.model.providerID,
-              nextProvider: altProviders[0],
-              preservedModel: task.model.modelID,
-            })
-            return
-          }
-        }
-      }
-
-      // Step 2: fall through to structured fail.
-      const reminderLines = [
-        `[STICKY MODEL UNAVAILABLE: ${requestedModel}]`,
-        `Provider returned: ${errorName ?? "provider stop"} — ${errorMsg.slice(0, 240)}`,
-        `No alternate connected provider could serve this model.`,
-        `Sticky-mode policy refused to swap to a different model. To proceed:`,
-        `  - refill provider credits, OR`,
-        `  - sign in to another provider that serves ${task.model?.modelID ?? "this model"}, OR`,
-        `  - relaunch with a different --model / agents.<>.model, OR`,
-        `  - drop the explicit pick to opt back into chain fallback`,
-      ]
-      this.queuePendingNotification(task.parentSessionId, reminderLines.join("\n"))
-      log("[background-agent] sticky-model definitive failure (no cross-provider alt)", {
-        taskId: task.id,
-        requestedModel,
-        errorName,
-        errorMessage: errorMsg.slice(0, 100),
-      })
-      // Fall through to the fail-task block (skip the transparent-retry
-      // guard since this provider error will not self-resolve).
-    } else {
-      const sessionId = task.sessionId
-      if (sessionId) {
-        const sessionStillAlive = await this.verifySessionExists(sessionId)
-        if (sessionStillAlive) {
-          this.logger("[background-agent] session.error received but session still alive, treating as transient:", {
-            taskId: task.id,
-            sessionId,
-            errorMessage: errorMsg?.slice(0, 200),
-          })
-          return
-        }
+    const sessionId = task.sessionId
+    if (sessionId) {
+      const sessionStillAlive = await this.verifySessionExists(sessionId)
+      if (sessionStillAlive) {
+        this.logger("[background-agent] session.error received but session still alive, treating as transient:", {
+          taskId: task.id,
+          sessionId,
+          errorMessage: errorMsg?.slice(0, 200),
+        })
+        return
       }
     }
 
@@ -1720,11 +1656,10 @@ The fallback retry session is now created and can be inspected directly.
     })
   }
 
-  private tryFallbackRetry(
+  private async tryFallbackRetry(
     task: BackgroundTask,
     errorInfo: { name?: string; message?: string },
     source: string,
-    options?: { forceCrossProvider?: boolean; crossProviderProviders?: string[] },
   ): Promise<boolean> {
     const previousSessionID = task.sessionId
     const result = tryFallbackRetry({
@@ -1736,8 +1671,6 @@ The fallback retry session is now created and can be inspected directly.
       idleDeferralTimers: this.idleDeferralTimers,
       queuesByKey: this.queuesByKey,
       processKey: (key: string) => this.processKey(key),
-      forceCrossProvider: options?.forceCrossProvider,
-      crossProviderProviders: options?.crossProviderProviders,
       onRetrying: ({ task, source }) => {
         const currentAttempt = getCurrentAttempt(task)
         const previousAttempt = getPreviousAttempt(task, currentAttempt?.attemptId)
@@ -1759,14 +1692,13 @@ The task was re-queued on a fallback model after a retryable failure.
         )
       },
     })
-    return result.then((retried) => {
-      if (retried && previousSessionID) {
-        this.clearSessionOutputObserved(previousSessionID)
-        this.clearSessionTodoObservation(previousSessionID)
-        subagentSessions.delete(previousSessionID)
-      }
-      return retried
-    })
+    const retried = await result
+    if (retried && previousSessionID) {
+      this.clearSessionOutputObserved(previousSessionID)
+      this.clearSessionTodoObservation(previousSessionID)
+      subagentSessions.delete(previousSessionID)
+    }
+    return retried
   }
 
   markForNotification(task: BackgroundTask): void {
@@ -2285,24 +2217,33 @@ The task was re-queued on a fallback model after a retryable failure.
         const shouldReply = allComplete || isTaskFailure
 
         const variant = promptContext?.model?.variant
+        const parentPromptContext: ParentWakePromptContext = {
+          ...(agent !== undefined ? { agent } : {}),
+          ...(model !== undefined ? { model } : {}),
+          ...(variant !== undefined ? { variant } : {}),
+          ...(resolvedTools ? { tools: resolvedTools } : {}),
+        }
+        const shouldDeferReply = shouldReply && await this.isSessionActive(task.parentSessionId)
 
         try {
           await this.client.session.promptAsync({
             path: { id: task.parentSessionId },
             body: {
-              noReply: !shouldReply,
-              ...(agent !== undefined ? { agent } : {}),
-              ...(model !== undefined ? { model } : {}),
-              ...(variant !== undefined ? { variant } : {}),
-              ...(resolvedTools ? { tools: resolvedTools } : {}),
+              noReply: shouldDeferReply || !shouldReply,
+              ...parentPromptContext,
               parts: [createInternalAgentTextPart(notification)],
             },
           })
+          if (shouldDeferReply) {
+            this.pendingParentWakes.set(task.parentSessionId, parentPromptContext)
+            this.schedulePendingParentWakeFlush(task.parentSessionId)
+          }
           log("[background-agent] Sent notification to parent session:", {
             taskId: task.id,
             allComplete,
             isTaskFailure,
-            noReply: !shouldReply,
+            noReply: shouldDeferReply || !shouldReply,
+            deferredReply: shouldDeferReply,
           })
         } catch (error) {
           if (isAbortedSessionError(error)) {
@@ -2334,11 +2275,97 @@ The task was re-queued on a fallback model after a retryable failure.
     return false
   }
 
-  private pruneStaleTasksAndNotifications(): void {
+  private async isSessionActive(sessionID: string): Promise<boolean> {
+    const sessionStatusMethod = this.client?.session?.status
+    if (typeof sessionStatusMethod !== "function") {
+      return false
+    }
+
+    try {
+      const statusResult = await this.client.session.status()
+      const statuses = normalizeSDKResponse(
+        statusResult,
+        {} as Record<string, SessionStatusInfo>,
+      )
+      const status = statuses[sessionID]
+      return typeof status?.type === "string" && isActiveSessionStatus(status.type)
+    } catch (error) {
+      log("[background-agent] Unable to check parent session status before wake:", {
+        sessionID,
+        error,
+      })
+      return false
+    }
+  }
+
+  private async flushPendingParentWake(sessionID: string): Promise<void> {
+    const wakeContext = this.pendingParentWakes.get(sessionID)
+    if (!wakeContext) {
+      this.clearPendingParentWakeTimer(sessionID)
+      return
+    }
+
+    if (await this.isSessionActive(sessionID)) {
+      this.schedulePendingParentWakeFlush(sessionID)
+      return
+    }
+
+    this.pendingParentWakes.delete(sessionID)
+    this.clearPendingParentWakeTimer(sessionID)
+    await settleAfterSessionIdle()
+
+    if (await this.isSessionActive(sessionID)) {
+      this.pendingParentWakes.set(sessionID, wakeContext)
+      this.schedulePendingParentWakeFlush(sessionID)
+      return
+    }
+
+    try {
+      await this.client.session.promptAsync({
+        path: { id: sessionID },
+        body: {
+          noReply: false,
+          ...wakeContext,
+          parts: [createInternalAgentTextPart(BACKGROUND_PARENT_WAKE_PROMPT)],
+        },
+      })
+      log("[background-agent] Sent deferred parent wake:", { sessionID })
+    } catch (error) {
+      log("[background-agent] Failed to send deferred parent wake:", { sessionID, error })
+    }
+  }
+
+  private schedulePendingParentWakeFlush(sessionID: string): void {
+    if (this.pendingParentWakeTimers.has(sessionID)) {
+      return
+    }
+
+    const timer = setTimeout(() => {
+      this.pendingParentWakeTimers.delete(sessionID)
+      void this.enqueueNotificationForParent(sessionID, () => this.flushPendingParentWake(sessionID)).catch((error) => {
+        log("[background-agent] Failed to retry pending parent wake:", { sessionID, error })
+      })
+    }, PENDING_PARENT_WAKE_RETRY_MS)
+
+    this.pendingParentWakeTimers.set(sessionID, timer)
+  }
+
+  private clearPendingParentWakeTimer(sessionID: string): void {
+    const timer = this.pendingParentWakeTimers.get(sessionID)
+    if (!timer) {
+      return
+    }
+
+    clearTimeout(timer)
+    this.pendingParentWakeTimers.delete(sessionID)
+  }
+
+  private pruneStaleTasksAndNotifications(allStatuses?: SessionStatusMap): void {
     pruneStaleTasksAndNotifications({
       tasks: this.tasks,
       notifications: this.notifications,
       taskTtlMs: this.config?.taskTtlMs,
+      sessionStatuses: allStatuses,
       onTaskPruned: (taskId, task, errorMessage) => {
         const wasPending = task.status === "pending"
         log("[background-agent] Pruning stale task:", { taskId, status: task.status, age: Math.round(((wasPending ? task.queuedAt?.getTime() : task.startedAt?.getTime()) ? (Date.now() - (wasPending ? task.queuedAt!.getTime() : task.startedAt!.getTime())) : 0) / 1000) + "s" })
@@ -2461,8 +2488,6 @@ The task was re-queued on a fallback model after a retryable failure.
     if (this.pollingInFlight) return
     this.pollingInFlight = true
     try {
-      this.pruneStaleTasksAndNotifications()
-
       let allStatuses: SessionStatusMap | undefined
       const sessionStatusMethod = this.client?.session?.status
       if (typeof sessionStatusMethod !== "function") {
@@ -2483,6 +2508,8 @@ The task was re-queued on a fallback model after a retryable failure.
           }
         }
       }
+
+      this.pruneStaleTasksAndNotifications(allStatuses)
 
       await this.checkAndInterruptStaleTasks(allStatuses)
 
@@ -2646,6 +2673,11 @@ The task was re-queued on a fallback model after a retryable failure.
     }
     this.idleDeferralTimers.clear()
 
+    for (const timer of this.pendingParentWakeTimers.values()) {
+      clearTimeout(timer)
+    }
+    this.pendingParentWakeTimers.clear()
+
     for (const sessionID of trackedSessionIDs) {
       subagentSessions.delete(sessionID)
       SessionCategoryRegistry.remove(sessionID)
@@ -2658,6 +2690,7 @@ The task was re-queued on a fallback model after a retryable failure.
     this.pendingNotifications.clear()
     this.pendingByParent.clear()
     this.notificationQueueByParent.clear()
+    this.pendingParentWakes.clear()
     this.rootDescendantCounts.clear()
     this.queuesByKey.clear()
     this.processingKeys.clear()

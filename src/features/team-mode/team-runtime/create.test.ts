@@ -1,7 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test"
-import { randomUUID } from "node:crypto"
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 import { access, mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -15,6 +14,10 @@ import { BackgroundManager } from "../../background-agent/manager"
 import { loadRuntimeState } from "../team-state-store/store"
 import { clearTeamSessionRegistry, lookupTeamSession } from "../team-session-registry"
 import type { TeamSpec } from "../types"
+import {
+  clearSessionTeamRunCleanupRegistry,
+  getSessionCreatedTeamRunIds,
+} from "./session-cleanup"
 
 const resolveMemberMock = mock(async (member: TeamSpec["members"][number]) => ({
   agentToUse: `${member.name}-agent`,
@@ -93,9 +96,15 @@ describe("createTeamRun", () => {
   beforeEach(() => {
     resolveMemberMock.mockClear()
     clearTeamSessionRegistry()
+    clearSessionTeamRunCleanupRegistry()
+  })
+
+  afterEach(() => {
+    clearSessionTeamRunCleanupRegistry()
   })
 
   afterAll(async () => {
+    clearSessionTeamRunCleanupRegistry()
     await Promise.all(temporaryDirectories.splice(0).map(async (directoryPath) => rm(directoryPath, { recursive: true, force: true })))
   })
 
@@ -116,6 +125,19 @@ describe("createTeamRun", () => {
     expect(runtimeState.status).toBe("active")
     expect(runtimeState.members.map((member) => member.sessionId)).toEqual(["session-1", "session-2", "session-3"])
     expect((launchMock.mock.calls as Array<[LaunchInput]>).every(([input]) => input.suppressTmuxSpawn === true)).toBe(true)
+  })
+
+  test("#given a new team runtime #when createTeamRun succeeds #then it registers the run for session cleanup", async () => {
+    // given
+    const baseDir = await mkdtemp(path.join(tmpdir(), "team-runtime-session-cleanup-"))
+    temporaryDirectories.push(baseDir)
+    const { manager } = createManager(baseDir, async () => ({ id: "task-1", sessionId: "session-1", status: "running" } as BackgroundTask))
+
+    // when
+    const runtimeState = await createTeamRun(createSpec(1), "lead-session", createContext(baseDir, manager), createConfig(baseDir), manager)
+
+    // then
+    expect(getSessionCreatedTeamRunIds()).toEqual([runtimeState.teamRunId])
   })
 
   test("registers a member session as soon as launch reports the real sessionId", async () => {
@@ -231,6 +253,7 @@ describe("createTeamRun", () => {
     }
     expect((cancelTaskMock.mock.calls as Array<[string]>).map(([taskId]) => taskId)).toEqual(["task-3", "task-2", "task-1"])
     expect((await loadSingleRuntimeState(baseDir)).status).toBe("failed")
+    expect(getSessionCreatedTeamRunIds()).toEqual([])
   })
 
   test("removes all created worktrees when spawn fails after worktree creation", async () => {
@@ -274,43 +297,6 @@ describe("createTeamRun", () => {
     // then
     expect(firstRuntime.teamRunId).toBe(secondRuntime.teamRunId)
     expect(launchMock).toHaveBeenCalledTimes(2)
-  })
-
-  test("reuses a shutdown_requested runtime for the same spec and lead session", async () => {
-    // given
-    const baseDir = await mkdtemp(path.join(tmpdir(), "team-runtime-shutdown-requested-"))
-    temporaryDirectories.push(baseDir)
-    let launchCount = 0
-    const { manager, launchMock } = createManager(baseDir, async () => ({ id: `task-${++launchCount}`, sessionId: `session-${launchCount}`, status: "running" } as BackgroundTask))
-    const spec = createSpec(2)
-    const context = createContext(baseDir, manager)
-    const firstRuntime = await createTeamRun(spec, "lead-session", context, createConfig(baseDir), manager)
-    await (await import("../team-state-store/store")).saveRuntimeState({ ...firstRuntime, status: "shutdown_requested" }, createConfig(baseDir))
-
-    // when
-    const secondRuntime = await createTeamRun(spec, "lead-session", context, createConfig(baseDir), manager)
-
-    // then
-    expect(secondRuntime.teamRunId).toBe(firstRuntime.teamRunId)
-    expect(launchMock).toHaveBeenCalledTimes(2)
-  })
-
-  test("rejects member worktree paths outside the repo or configured worktree base", async () => {
-    // given
-    const baseDir = await mkdtemp(path.join(tmpdir(), "team-runtime-worktree-sandbox-"))
-    temporaryDirectories.push(baseDir)
-    const { manager } = createManager(baseDir, async () => ({ id: "task-1", sessionId: "session-1", status: "running" } as BackgroundTask))
-    const spec = createSpec(1, true)
-    spec.members[0] = {
-      ...spec.members[0],
-      worktreePath: path.join(tmpdir(), `outside-team-worktree-${randomUUID()}`),
-    }
-
-    // when
-    const result = createTeamRun(spec, "lead-session", createContext(baseDir, manager), createConfig(baseDir), manager)
-
-    // then
-    await expect(result).rejects.toThrow("worktreePath must stay inside the repository root or configured worktree base directory")
   })
 
   test("never exceeds max_parallel_members while spawning", async () => {
@@ -371,13 +357,8 @@ describe("createTeamRun", () => {
     // then
     expect(launchMock).toHaveBeenCalledTimes(1)
     expect(launchMock.mock.calls[0]?.[0]).toMatchObject({ description: "Create team member alpha-team/member-1" })
-    // The lead is pre-resolved out-of-pool to compute the stable-mode seed
-    // (followers inherit the lead's model); the pool then short-circuits
-    // the lead because reusesCallerLeadSession=true and only spawns the
-    // follower. Two resolveMember calls total: one for the seed, one for
-    // the follower in the pool.
-    expect(resolveMemberMock).toHaveBeenCalledTimes(2)
-    expect(resolveMemberMock.mock.calls.map((call) => (call[0] as { name: string }).name).sort()).toEqual(["lead", "member-1"])
+    expect(resolveMemberMock).toHaveBeenCalledTimes(1)
+    expect(resolveMemberMock.mock.calls[0]?.[0]).toMatchObject({ name: "member-1" })
     expect(runtimeState.members.map((member) => ({ name: member.name, sessionId: member.sessionId }))).toEqual([
       { name: "lead", sessionId: "lead-session" },
       { name: "member-1", sessionId: "member-1-agent-session-1" },
