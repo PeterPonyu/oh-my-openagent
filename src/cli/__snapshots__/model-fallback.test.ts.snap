@@ -1053,11 +1053,11 @@ exports[`generateModelConfig fallback providers uses OpenCode Zen models when on
           "model": "opencode/kimi-k2.5",
         },
         {
-          "model": "opencode/gpt-5.5",
-          "variant": "medium",
+          "model": "opencode/glm-5",
         },
         {
-          "model": "opencode/glm-5",
+          "model": "opencode/gpt-5.5",
+          "variant": "medium",
         },
         {
           "model": "opencode/big-pickle",
@@ -1278,11 +1278,11 @@ exports[`generateModelConfig fallback providers uses OpenCode Zen models with is
           "model": "opencode/kimi-k2.5",
         },
         {
-          "model": "opencode/gpt-5.5",
-          "variant": "medium",
+          "model": "opencode/glm-5",
         },
         {
-          "model": "opencode/glm-5",
+          "model": "opencode/gpt-5.5",
+          "variant": "medium",
         },
         {
           "model": "opencode/big-pickle",
@@ -1363,14 +1363,14 @@ exports[`generateModelConfig fallback providers uses OpenCode Zen models with is
     "unspecified-high": {
       "fallback_models": [
         {
-          "model": "opencode/gpt-5.5",
-          "variant": "high",
-        },
-        {
           "model": "opencode/glm-5",
         },
         {
           "model": "opencode/kimi-k2.5",
+        },
+        {
+          "model": "opencode/gpt-5.5",
+          "variant": "high",
         },
       ],
       "model": "opencode/claude-opus-4-7",
@@ -2034,11 +2034,11 @@ exports[`generateModelConfig mixed provider scenarios uses Claude + OpenCode Zen
           "model": "opencode/kimi-k2.5",
         },
         {
-          "model": "opencode/gpt-5.5",
-          "variant": "medium",
+          "model": "opencode/glm-5",
         },
         {
-          "model": "opencode/glm-5",
+          "model": "opencode/gpt-5.5",
+          "variant": "medium",
         },
         {
           "model": "opencode/big-pickle",
@@ -2861,18 +2861,18 @@ exports[`generateModelConfig mixed provider scenarios uses all fallback provider
           "model": "opencode/kimi-k2.5",
         },
         {
+          "model": "zai-coding-plan/glm-5",
+        },
+        {
+          "model": "opencode/glm-5",
+        },
+        {
           "model": "github-copilot/gpt-5.5",
           "variant": "medium",
         },
         {
           "model": "opencode/gpt-5.5",
           "variant": "medium",
-        },
-        {
-          "model": "zai-coding-plan/glm-5",
-        },
-        {
-          "model": "opencode/glm-5",
         },
         {
           "model": "opencode/big-pickle",
@@ -3332,6 +3332,12 @@ exports[`generateModelConfig mixed provider scenarios uses all providers togethe
           "model": "opencode/kimi-k2.5",
         },
         {
+          "model": "zai-coding-plan/glm-5",
+        },
+        {
+          "model": "opencode/glm-5",
+        },
+        {
           "model": "openai/gpt-5.5",
           "variant": "medium",
         },
@@ -3342,12 +3348,6 @@ exports[`generateModelConfig mixed provider scenarios uses all providers togethe
         {
           "model": "opencode/gpt-5.5",
           "variant": "medium",
-        },
-        {
-          "model": "zai-coding-plan/glm-5",
-        },
-        {
-          "model": "opencode/glm-5",
         },
         {
           "model": "opencode/big-pickle",
@@ -3892,6 +3892,12 @@ exports[`generateModelConfig mixed provider scenarios uses all providers with is
           "model": "opencode/kimi-k2.5",
         },
         {
+          "model": "zai-coding-plan/glm-5",
+        },
+        {
+          "model": "opencode/glm-5",
+        },
+        {
           "model": "openai/gpt-5.5",
           "variant": "medium",
         },
@@ -3902,12 +3908,6 @@ exports[`generateModelConfig mixed provider scenarios uses all providers with is
         {
           "model": "opencode/gpt-5.5",
           "variant": "medium",
-        },
-        {
-          "model": "zai-coding-plan/glm-5",
-        },
-        {
-          "model": "opencode/glm-5",
         },
         {
           "model": "opencode/big-pickle",
@@ -4094,6 +4094,15 @@ exports[`generateModelConfig mixed provider scenarios uses all providers with is
           "variant": "max",
         },
         {
+          "model": "zai-coding-plan/glm-5",
+        },
+        {
+          "model": "opencode/glm-5",
+        },
+        {
+          "model": "opencode/kimi-k2.5",
+        },
+        {
           "model": "openai/gpt-5.5",
           "variant": "high",
         },
@@ -4104,15 +4113,6 @@ exports[`generateModelConfig mixed provider scenarios uses all providers with is
         {
           "model": "opencode/gpt-5.5",
           "variant": "high",
-        },
-        {
-          "model": "zai-coding-plan/glm-5",
-        },
-        {
-          "model": "opencode/glm-5",
-        },
-        {
-          "model": "opencode/kimi-k2.5",
         },
       ],
       "model": "anthropic/claude-opus-4-7",
@@ -4343,11 +4343,11 @@ exports[`generateModelConfig Vercel AI Gateway provider uses vercel/ model strin
           "model": "vercel/moonshotai/kimi-k2.5",
         },
         {
-          "model": "vercel/openai/gpt-5.5",
-          "variant": "medium",
+          "model": "vercel/zai/glm-5",
         },
         {
-          "model": "vercel/zai/glm-5",
+          "model": "vercel/openai/gpt-5.5",
+          "variant": "medium",
         },
       ],
       "model": "vercel/anthropic/claude-opus-4.7",
@@ -4654,11 +4654,11 @@ exports[`generateModelConfig Vercel AI Gateway provider uses vercel/ model strin
           "model": "vercel/moonshotai/kimi-k2.5",
         },
         {
-          "model": "vercel/openai/gpt-5.5",
-          "variant": "medium",
+          "model": "vercel/zai/glm-5",
         },
         {
-          "model": "vercel/zai/glm-5",
+          "model": "vercel/openai/gpt-5.5",
+          "variant": "medium",
         },
       ],
       "model": "vercel/anthropic/claude-opus-4.7",
@@ -4757,10 +4757,6 @@ exports[`generateModelConfig Vercel AI Gateway provider uses vercel/ model strin
     "unspecified-high": {
       "fallback_models": [
         {
-          "model": "vercel/openai/gpt-5.5",
-          "variant": "high",
-        },
-        {
           "model": "vercel/zai/glm-5",
         },
         {
@@ -4768,6 +4764,10 @@ exports[`generateModelConfig Vercel AI Gateway provider uses vercel/ model strin
         },
         {
           "model": "vercel/moonshotai/kimi-k2.5",
+        },
+        {
+          "model": "vercel/openai/gpt-5.5",
+          "variant": "high",
         },
       ],
       "model": "vercel/anthropic/claude-opus-4.7",

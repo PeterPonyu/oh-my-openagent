@@ -3,6 +3,7 @@ import path from "node:path"
 
 import type { TeamModeConfig } from "../../../config/schema/team-mode"
 import { QUESTION_DENIED_SESSION_PERMISSION } from "../../../shared/question-denied-session-permission"
+import { readConnectedProvidersCache } from "../../../shared/connected-providers-cache"
 import type { ExecutorContext } from "../../../tools/delegate-task/executor-types"
 import type { BackgroundTask } from "../../background-agent/types"
 import type { BackgroundManager } from "../../background-agent/manager"
@@ -14,10 +15,12 @@ import type { RuntimeState, TeamSpec } from "../types"
 import { activateTeamLayout } from "./activate-team-layout"
 import { cleanupTeamRunResources } from "./cleanup-team-run-resources"
 import { buildTeammateCommunicationAddendum } from "../member-guidance"
-import { resolveMember } from "./resolve-member"
+import { resolveMemberWithPolicy } from "./resolve-member"
 import { shouldReuseCallerLeadSession } from "../resolve-caller-team-lead"
 import { sweepStaleTeamSessions } from "../team-layout-tmux/sweep-stale-team-sessions"
 import { registerTeamRunForSessionCleanup } from "./session-team-run-registry"
+import { resolveMemberSelectionMode } from "./member-selection-policy"
+import type { StableSeed } from "./member-selection-policy"
 
 const SESSION_ID_POLL_MS = 25
 
@@ -29,6 +32,7 @@ type SpawnedMemberResource = {
 type CreateTeamRunOptions = {
   callerAgentTypeId?: string
   parentMessageID?: string
+  member_selection?: TeamModeConfig["member_selection"]
 }
 
 export class TeamRunCreateError extends Error {
@@ -160,9 +164,19 @@ export async function createTeamRun(
     let nextMemberIndex = 0
     let failure: Error | undefined
     const workerCount = Math.min(config.max_parallel_members, spec.members.length)
-    const categoryExamples = Object.keys(ctx.userCategories ?? {}).join(", ")
+  const categoryExamples = Object.keys(ctx.userCategories ?? {}).join(", ")
+  const memberSelectionMode = resolveMemberSelectionMode({
+    callArg: options?.member_selection,
+    spec,
+    config,
+  })
+  const memberSelectionPolicy = memberSelectionMode === "creative"
+    ? { kind: "creative" as const, connectedProviders: readConnectedProvidersCache() }
+    : { kind: "stable" as const }
+  let stableSeed: StableSeed | undefined
+  let followerIndex = 0
 
-    await Promise.all(Array.from({ length: workerCount }, async () => {
+  await Promise.all(Array.from({ length: workerCount }, async () => {
       while (!failure) {
         if (Date.now() > deadlineAt) {
           failure = new Error("team creation exceeded max_wall_clock_minutes")
@@ -187,7 +201,20 @@ export async function createTeamRun(
             }
             continue
           }
-          const resolvedMember = await resolveMember(member, ctx, categoryExamples, spec.leadAgentId)
+          const isLead = member.name === spec.leadAgentId
+          const resolvedMember = await resolveMemberWithPolicy({
+            member,
+            ctx,
+            policy: memberSelectionPolicy,
+            seed: stableSeed,
+            followerIndex: isLead ? 0 : followerIndex++,
+            isLead,
+            categoryExamples,
+            parentAgent: spec.leadAgentId,
+          })
+          if (isLead && memberSelectionPolicy.kind === "stable" && resolvedMember.model) {
+            stableSeed = { model: resolvedMember.model }
+          }
           const task = await bgMgr.launch({
             description: `Create team member ${spec.name}/${member.name}`,
             prompt: buildMemberPrompt(spec, member, runtimeState.teamRunId, config, resource.worktreePath),

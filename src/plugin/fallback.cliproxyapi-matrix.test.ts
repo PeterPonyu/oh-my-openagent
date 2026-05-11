@@ -278,6 +278,7 @@ async function sendNextMessage(
 async function triggerSessionError(
   eventHandler: ReturnType<typeof createHarness>["eventHandler"],
   sessionID: string,
+  hardFailure = false,
 ) {
   await eventHandler(asHarnessEventInput({
     event: {
@@ -289,8 +290,10 @@ async function triggerSessionError(
         modelID: PRIMARY_MODEL.modelID,
         model: PRIMARY_MODEL_STRING,
         error: {
-          statusCode: 529,
-          message: `Overloaded upstream for ${PRIMARY_MODEL_STRING}`,
+          statusCode: hardFailure ? 401 : 529,
+          message: hardFailure
+            ? `API key is missing from environment variable for ${PRIMARY_MODEL_STRING}`
+            : `Overloaded upstream for ${PRIMARY_MODEL_STRING}`,
         },
       },
     },
@@ -300,6 +303,7 @@ async function triggerSessionError(
 async function triggerSessionStatusRetry(
   eventHandler: ReturnType<typeof createHarness>["eventHandler"],
   sessionID: string,
+  hardFailure = false,
 ) {
   await eventHandler(asHarnessEventInput({
     event: {
@@ -312,7 +316,9 @@ async function triggerSessionStatusRetry(
           type: "retry",
           attempt: 1,
           message:
-            "All credentials for model claude-opus-4-7 are cooling down [retrying in 7m 56s attempt #1]",
+            hardFailure
+              ? "API key is missing from environment variable for model claude-opus-4-7 [retrying in 7m 56s attempt #1]"
+              : "All credentials for model claude-opus-4-7 are cooling down [retrying in 7m 56s attempt #1]",
           next: 476,
         },
       },
@@ -323,6 +329,7 @@ async function triggerSessionStatusRetry(
 async function triggerAssistantMessageError(
   eventHandler: ReturnType<typeof createHarness>["eventHandler"],
   sessionID: string,
+  hardFailure = false,
 ) {
   await eventHandler(asHarnessEventInput({
     event: {
@@ -339,8 +346,10 @@ async function triggerAssistantMessageError(
           agent: "Sisyphus - Ultraworker",
           path: { cwd: "/tmp", root: "/tmp" },
           error: {
-            statusCode: 529,
-            message: `Overloaded upstream for ${PRIMARY_MODEL_STRING}`,
+            statusCode: hardFailure ? 401 : 529,
+            message: hardFailure
+              ? `API key is missing from environment variable for ${PRIMARY_MODEL_STRING}`
+              : `Overloaded upstream for ${PRIMARY_MODEL_STRING}`,
           },
         },
       },
@@ -453,7 +462,7 @@ describe("CLIProxyAPI-only fallback matrix", () => {
     const harness = createHarness({ mode: "runtime" })
 
     await primeMainSession(harness.eventHandler, sessionID)
-    await triggerSessionError(harness.eventHandler, sessionID)
+    await triggerSessionError(harness.eventHandler, sessionID, true)
 
     const output = await sendNextMessage(harness.chatMessageHandler, {
       sessionID,
@@ -472,7 +481,7 @@ describe("CLIProxyAPI-only fallback matrix", () => {
     const harness = createHarness({ mode: "runtime" })
 
     await primeMainSession(harness.eventHandler, sessionID)
-    await triggerSessionStatusRetry(harness.eventHandler, sessionID)
+    await triggerSessionStatusRetry(harness.eventHandler, sessionID, true)
 
     const output = await sendNextMessage(harness.chatMessageHandler, {
       sessionID,
@@ -491,7 +500,7 @@ describe("CLIProxyAPI-only fallback matrix", () => {
     const harness = createHarness({ mode: "runtime" })
 
     await primeMainSession(harness.eventHandler, sessionID)
-    await triggerAssistantMessageError(harness.eventHandler, sessionID)
+    await triggerAssistantMessageError(harness.eventHandler, sessionID, true)
 
     const output = await sendNextMessage(harness.chatMessageHandler, {
       sessionID,
@@ -510,7 +519,7 @@ describe("CLIProxyAPI-only fallback matrix", () => {
     const harness = createHarness({ mode: "both" })
 
     await primeMainSession(harness.eventHandler, sessionID)
-    await triggerSessionError(harness.eventHandler, sessionID)
+    await triggerSessionError(harness.eventHandler, sessionID, true)
 
     const output = await sendNextMessage(harness.chatMessageHandler, {
       sessionID,
@@ -529,7 +538,7 @@ describe("CLIProxyAPI-only fallback matrix", () => {
     const harness = createHarness({ mode: "both" })
 
     await primeMainSession(harness.eventHandler, sessionID)
-    await triggerSessionStatusRetry(harness.eventHandler, sessionID)
+    await triggerSessionStatusRetry(harness.eventHandler, sessionID, true)
 
     const output = await sendNextMessage(harness.chatMessageHandler, {
       sessionID,
@@ -548,7 +557,7 @@ describe("CLIProxyAPI-only fallback matrix", () => {
     const harness = createHarness({ mode: "both" })
 
     await primeMainSession(harness.eventHandler, sessionID)
-    await triggerAssistantMessageError(harness.eventHandler, sessionID)
+    await triggerAssistantMessageError(harness.eventHandler, sessionID, true)
 
     const output = await sendNextMessage(harness.chatMessageHandler, {
       sessionID,
