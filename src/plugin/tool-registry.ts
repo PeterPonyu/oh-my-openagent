@@ -43,6 +43,7 @@ import {
   createTaskList,
   createTaskUpdateTool,
   createHashlineEditTool,
+  createPickModelTool,
 } from "../tools"
 import { getMainSessionID } from "../features/claude-code-session-state"
 import { filterDisabledTools } from "../shared/disabled-tools"
@@ -71,6 +72,7 @@ type ToolRegistryFactories = {
   createTaskList: typeof createTaskList
   createTaskUpdateTool: typeof createTaskUpdateTool
   createHashlineEditTool: typeof createHashlineEditTool
+  createPickModelTool: typeof createPickModelTool
   createTeamApproveShutdownTool: typeof createTeamApproveShutdownTool
   createTeamCreateTool: typeof createTeamCreateTool
   createTeamDeleteTool: typeof createTeamDeleteTool
@@ -104,6 +106,7 @@ const defaultToolRegistryFactories: ToolRegistryFactories = {
   createTaskList,
   createTaskUpdateTool,
   createHashlineEditTool,
+  createPickModelTool,
   createTeamApproveShutdownTool,
   createTeamCreateTool,
   createTeamDeleteTool,
@@ -306,6 +309,11 @@ export function createToolRegistry(args: {
     ? { edit: factories.createHashlineEditTool(ctx) }
     : {}
 
+  const pickModelEnabled = pluginConfig.display?.auto_pick ?? false
+  const pickModelToolsRecord: Record<string, ToolDefinition> = pickModelEnabled
+    ? { pick_model: factories.createPickModelTool({ pluginConfig }) }
+    : {}
+
   const teamModeToolsRecord: Record<string, ToolDefinition> = pluginConfig.team_mode?.enabled
     ? {
         team_create: factories.createTeamCreateTool(
@@ -354,6 +362,7 @@ export function createToolRegistry(args: {
     ...teamModeToolsRecord,
     ...taskToolsRecord,
     ...hashlineToolsRecord,
+    ...pickModelToolsRecord,
   }
 
   for (const toolDefinition of Object.values(allTools)) {
