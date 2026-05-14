@@ -7,7 +7,7 @@ import { getSessionModel, setSessionModel } from "../shared/session-model-state"
 import { getMainSessionID, setSessionAgent, subagentSessions } from "../features/claude-code-session-state"
 import { applyUltraworkModelOverrideOnMessage } from "./ultrawork-model-override"
 import { NATIVE_LOOP_TRIGGERED_FLAG } from "./command-execute-before"
-import { maybeAutoPrintPanel } from "../features/roles-models"
+import { maybeAutoPrintPanel, resolveOverrideModel } from "../features/roles-models"
 import { parseRalphLoopArguments } from "../hooks/ralph-loop/command-arguments"
 
 import type { CreatedHooks } from "../create-hooks"
@@ -211,6 +211,14 @@ export function createChatMessageHandler(args: {
     )
     if (storedMainSessionModel) {
       output.message["model"] = storedMainSessionModel
+    }
+
+    const pickedModel = resolveOverrideModel(
+      input.sessionID,
+      input.agent ? getAgentConfigKey(input.agent) : undefined,
+    )
+    if (pickedModel) {
+      output.message["model"] = pickedModel
     }
 
     if (!isRuntimeFallbackEnabled) {
