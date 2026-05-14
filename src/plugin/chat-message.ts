@@ -4,9 +4,10 @@ import type { PluginContext } from "./types"
 import { isModelCacheAvailable, log } from "../shared"
 import { getAgentConfigKey } from "../shared/agent-display-names"
 import { getSessionModel, setSessionModel } from "../shared/session-model-state"
-import { getMainSessionID, setSessionAgent, subagentSessions } from "../features/claude-code-session-state"
+import { getMainSessionID, getSessionAgent, setSessionAgent, subagentSessions } from "../features/claude-code-session-state"
 import { applyUltraworkModelOverrideOnMessage } from "./ultrawork-model-override"
 import { NATIVE_LOOP_TRIGGERED_FLAG } from "./command-execute-before"
+import { maybeAutoPrintPanel, resolveOverrideModel } from "../features/roles-models"
 import { parseRalphLoopArguments } from "../hooks/ralph-loop/command-arguments"
 
 import type { CreatedHooks } from "../create-hooks"
@@ -22,6 +23,7 @@ export type ChatMessageInput = {
   sessionID: string
   agent?: string
   model?: { providerID: string; modelID: string }
+  messageID?: string
 }
 type StartWorkHookOutput = { parts: Array<{ type: string; text?: string }> }
 
@@ -201,6 +203,13 @@ export function createChatMessageHandler(args: {
       firstMessageVariantGate.markApplied(input.sessionID)
     }
 
+    // Auto-print panel uses its own per-session idempotency (SESSION_PANEL_SHOWN),
+    // so we call it on every chat.message rather than gating on firstMessageVariantGate.
+    // The gate only fires for sessions that opencode emitted session.created for during
+    // this plugin lifetime; reconnects to existing sessions would otherwise miss the
+    // panel entirely.
+    maybeAutoPrintPanel(input.sessionID, input.messageID, output, pluginConfig)
+
     const storedMainSessionModel = getStoredMainSessionModel(
       input,
       pluginConfig,
@@ -209,6 +218,19 @@ export function createChatMessageHandler(args: {
     )
     if (storedMainSessionModel) {
       output.message["model"] = storedMainSessionModel
+    }
+
+    // Resolve the agent for override lookup. Prefer input.agent (the
+    // user-selected agent for this turn) and fall back to the session's
+    // primary agent recorded earlier — opencode occasionally invokes
+    // chat.message with input.agent unset, and without the fallback an
+    // active /pick override would be silently skipped for those turns.
+    const overrideAgentKey = input.agent
+      ? getAgentConfigKey(input.agent)
+      : (getSessionAgent(input.sessionID) ? getAgentConfigKey(getSessionAgent(input.sessionID)!) : undefined)
+    const pickedModel = resolveOverrideModel(input.sessionID, overrideAgentKey)
+    if (pickedModel) {
+      output.message["model"] = pickedModel
     }
 
     if (!isRuntimeFallbackEnabled) {

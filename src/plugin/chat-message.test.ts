@@ -13,6 +13,8 @@ import { _resetForTesting, setMainSession, subagentSessions, registerAgentName, 
 import { getAgentListDisplayName } from "../shared/agent-display-names"
 import { getOmoOpenCodeCacheDir, getOpenCodeCacheDir } from "../shared/data-path"
 import { clearSessionModel, getSessionModel, setSessionModel } from "../shared/session-model-state"
+import { setOverride as setRolePick, _resetAllForTests as resetRolesModelsState } from "../features/roles-models/state"
+import { _resetAutoPrintForTests } from "../features/roles-models/command-handler"
 import { unsafeTestValue } from "../../test-support/unsafe-test-value"
 
 type ChatMessagePart = { type: string; text?: string; [key: string]: unknown }
@@ -781,5 +783,157 @@ describe("createChatMessageHandler - TUI variant passthrough", () => {
 
     //#then
     expect(getSessionAgent("test-session")).toBe("Hephaestus - Deep Agent")
+  })
+})
+
+describe("createChatMessageHandler - /pick override application", () => {
+  beforeEach(() => {
+    resetRolesModelsState()
+  })
+
+  test("#given a /pick override for the calling agent #when handler runs #then output.message.model is set to the parsed provider/model", async () => {
+    //#given
+    setMainSession("test-session")
+    setRolePick("test-session", "sisyphus", { model: "openai/gpt-5.5" })
+    const args = createMockHandlerArgs({ shouldOverride: false })
+    const handler = createChatMessageHandler(args)
+    const input = createMockInput("sisyphus")
+    const output = createMockOutput()
+
+    //#when
+    await handler(input, output)
+
+    //#then
+    expect(output.message["model"]).toEqual({ providerID: "openai", modelID: "gpt-5.5" })
+    expect(getSessionModel("test-session")).toEqual({ providerID: "openai", modelID: "gpt-5.5" })
+  })
+
+  test("#given an override exists only for a different role #when handler runs #then the calling agent's model is untouched", async () => {
+    //#given
+    setMainSession("test-session")
+    setRolePick("test-session", "hephaestus", { model: "openai/gpt-5.5" })
+    const args = createMockHandlerArgs({ shouldOverride: false })
+    const handler = createChatMessageHandler(args)
+    const input = createMockInput("sisyphus", { providerID: "anthropic", modelID: "claude-opus-4-7" })
+    const output = createMockOutput()
+
+    //#when
+    await handler(input, output)
+
+    //#then - sisyphus's input.model is preserved (no override applies)
+    expect(output.message["model"]).toBeUndefined()
+  })
+
+  test("#given a /pick override #when handler runs after the stored session model #then the pick wins", async () => {
+    //#given
+    setMainSession("test-session")
+    setSessionModel("test-session", { providerID: "anthropic", modelID: "claude-opus-4-7" })
+    setRolePick("test-session", "sisyphus", { model: "openai/gpt-5.5" })
+    const args = createMockHandlerArgs({ shouldOverride: false })
+    const handler = createChatMessageHandler(args)
+    const input = createMockInput("sisyphus")
+    const output = createMockOutput()
+
+    //#when
+    await handler(input, output)
+
+    //#then
+    expect(output.message["model"]).toEqual({ providerID: "openai", modelID: "gpt-5.5" })
+  })
+
+  test("#given input.agent is absent but the session has a stored primary agent #when handler runs #then the /pick override still applies", async () => {
+    //#given - simulate the opencode invocation pattern where chat.message
+    // fires without input.agent populated (e.g. some internal compaction or
+    // model-fallback retry path); a prior turn already recorded the session's
+    // primary agent via setSessionAgent.
+    setMainSession("test-session")
+    updateSessionAgent("test-session", "sisyphus")
+    setRolePick("test-session", "sisyphus", { model: "openai/gpt-5.5" })
+    const args = createMockHandlerArgs({ shouldOverride: false })
+    const handler = createChatMessageHandler(args)
+    const input = { sessionID: "test-session", messageID: "msg_agentless" }
+    const output = createMockOutput()
+
+    //#when
+    await handler(input, output)
+
+    //#then - override applies because we resolved the agent from session state
+    expect(output.message["model"]).toEqual({ providerID: "openai", modelID: "gpt-5.5" })
+  })
+})
+
+describe("createChatMessageHandler - auto-print panel does not depend on firstMessageVariantGate", () => {
+  beforeEach(() => {
+    _resetAutoPrintForTests()
+  })
+
+  test("#given show_models_on_session_start is true and the session bypassed session.created (gate returns false) #when handler runs #then the panel is still injected once", async () => {
+    //#given - simulate the reconnect-to-existing-session case: opencode never
+    // fired session.created for this sessionID (so firstMessageVariantGate's
+    // pending set stays empty and shouldOverride returns false), but the user
+    // still sent a message and the auto-print flag is on.
+    const args = createMockHandlerArgs({
+      shouldOverride: false,
+      pluginConfig: {
+        display: { show_models_on_session_start: true },
+        agents: { sisyphus: { model: "anthropic/claude-opus-4-7" } },
+      },
+    })
+    const handler = createChatMessageHandler(args)
+    const input = { ...createMockInput("sisyphus"), messageID: "msg_iso_first" }
+    const output = createMockOutput()
+
+    //#when
+    await handler(input, output)
+
+    //#then - panel fires because maybeAutoPrintPanel uses its own per-session idempotency
+    const panelPart = output.parts.find((p) => p.type === "text" && (p.text ?? "").includes("Roles · Models"))
+    expect(panelPart).toBeDefined()
+    expect(panelPart?.text).toContain("sisyphus")
+  })
+
+  test("#given two consecutive chat.message calls in the same session #when handler runs both #then the panel is injected only once (idempotent)", async () => {
+    //#given
+    const args = createMockHandlerArgs({
+      shouldOverride: false,
+      pluginConfig: {
+        display: { show_models_on_session_start: true },
+        agents: { sisyphus: { model: "anthropic/claude-opus-4-7" } },
+      },
+    })
+    const handler = createChatMessageHandler(args)
+    const firstInput = { ...createMockInput("sisyphus"), messageID: "msg_iso_1" }
+    const firstOutput = createMockOutput()
+    await handler(firstInput, firstOutput)
+
+    const secondInput = { ...createMockInput("sisyphus"), messageID: "msg_iso_2" }
+    const secondOutput = createMockOutput()
+
+    //#when
+    await handler(secondInput, secondOutput)
+
+    //#then
+    expect(firstOutput.parts.find((p) => (p.text ?? "").includes("Roles · Models"))).toBeDefined()
+    expect(secondOutput.parts.find((p) => (p.text ?? "").includes("Roles · Models"))).toBeUndefined()
+  })
+
+  test("#given show_models_on_session_start is false #when handler runs #then no panel is injected", async () => {
+    //#given - regression guard: the config flag still gates injection.
+    const args = createMockHandlerArgs({
+      shouldOverride: false,
+      pluginConfig: {
+        display: { show_models_on_session_start: false },
+        agents: { sisyphus: { model: "anthropic/claude-opus-4-7" } },
+      },
+    })
+    const handler = createChatMessageHandler(args)
+    const input = createMockInput("sisyphus")
+    const output = createMockOutput()
+
+    //#when
+    await handler(input, output)
+
+    //#then
+    expect(output.parts.find((p) => (p.text ?? "").includes("Roles · Models"))).toBeUndefined()
   })
 })
