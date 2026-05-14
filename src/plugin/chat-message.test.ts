@@ -15,6 +15,7 @@ import { getOmoOpenCodeCacheDir, getOpenCodeCacheDir } from "../shared/data-path
 import { clearSessionModel, getSessionModel, setSessionModel } from "../shared/session-model-state"
 import { setOverride as setRolePick, _resetAllForTests as resetRolesModelsState } from "../features/roles-models/state"
 import { _resetAutoPrintForTests } from "../features/roles-models/command-handler"
+import { _resetAllForTests as resetAgentHandoffState } from "../features/agent-handoff/state"
 import { unsafeTestValue } from "../../test-support/unsafe-test-value"
 
 type ChatMessagePart = { type: string; text?: string; [key: string]: unknown }
@@ -83,6 +84,7 @@ afterEach(() => {
   clearSessionModel("test-session")
   clearSessionModel("main-session")
   clearSessionModel("subagent-session")
+  resetAgentHandoffState()
 })
 
 describe("createChatMessageHandler - cache warning behavior", () => {
@@ -537,11 +539,17 @@ describe("createChatMessageHandler - plain ultrawork keyword routing", () => {
   })
 })
 
-function createMockInput(agent?: string, model?: { providerID: string; modelID: string }) {
+let mockInputCounter = 0
+function createMockInput(
+  agent?: string,
+  model?: { providerID: string; modelID: string },
+  messageID?: string,
+) {
   return {
     sessionID: "test-session",
     agent,
     model,
+    messageID: messageID ?? `msg_test_${++mockInputCounter}`,
   }
 }
 
@@ -842,10 +850,7 @@ describe("createChatMessageHandler - /pick override application", () => {
   })
 
   test("#given input.agent is absent but the session has a stored primary agent #when handler runs #then the /pick override still applies", async () => {
-    //#given - simulate the opencode invocation pattern where chat.message
-    // fires without input.agent populated (e.g. some internal compaction or
-    // model-fallback retry path); a prior turn already recorded the session's
-    // primary agent via setSessionAgent.
+    //#given
     setMainSession("test-session")
     updateSessionAgent("test-session", "sisyphus")
     setRolePick("test-session", "sisyphus", { model: "openai/gpt-5.5" })
@@ -857,7 +862,7 @@ describe("createChatMessageHandler - /pick override application", () => {
     //#when
     await handler(input, output)
 
-    //#then - override applies because we resolved the agent from session state
+    //#then
     expect(output.message["model"]).toEqual({ providerID: "openai", modelID: "gpt-5.5" })
   })
 })
@@ -867,11 +872,7 @@ describe("createChatMessageHandler - auto-print panel does not depend on firstMe
     _resetAutoPrintForTests()
   })
 
-  test("#given show_models_on_session_start is true and the session bypassed session.created (gate returns false) #when handler runs #then the panel is still injected once", async () => {
-    //#given - simulate the reconnect-to-existing-session case: opencode never
-    // fired session.created for this sessionID (so firstMessageVariantGate's
-    // pending set stays empty and shouldOverride returns false), but the user
-    // still sent a message and the auto-print flag is on.
+  test("#given show_models_on_session_start is true and the session bypassed session.created #when handler runs #then the panel is still injected once", async () => {
     const args = createMockHandlerArgs({
       shouldOverride: false,
       pluginConfig: {
@@ -883,17 +884,14 @@ describe("createChatMessageHandler - auto-print panel does not depend on firstMe
     const input = { ...createMockInput("sisyphus"), messageID: "msg_iso_first" }
     const output = createMockOutput()
 
-    //#when
     await handler(input, output)
 
-    //#then - panel fires because maybeAutoPrintPanel uses its own per-session idempotency
     const panelPart = output.parts.find((p) => p.type === "text" && (p.text ?? "").includes("Roles · Models"))
     expect(panelPart).toBeDefined()
     expect(panelPart?.text).toContain("sisyphus")
   })
 
-  test("#given two consecutive chat.message calls in the same session #when handler runs both #then the panel is injected only once (idempotent)", async () => {
-    //#given
+  test("#given two consecutive chat.message calls in the same session #when handler runs both #then the panel is injected only once", async () => {
     const args = createMockHandlerArgs({
       shouldOverride: false,
       pluginConfig: {
@@ -909,16 +907,13 @@ describe("createChatMessageHandler - auto-print panel does not depend on firstMe
     const secondInput = { ...createMockInput("sisyphus"), messageID: "msg_iso_2" }
     const secondOutput = createMockOutput()
 
-    //#when
     await handler(secondInput, secondOutput)
 
-    //#then
     expect(firstOutput.parts.find((p) => (p.text ?? "").includes("Roles · Models"))).toBeDefined()
     expect(secondOutput.parts.find((p) => (p.text ?? "").includes("Roles · Models"))).toBeUndefined()
   })
 
   test("#given show_models_on_session_start is false #when handler runs #then no panel is injected", async () => {
-    //#given - regression guard: the config flag still gates injection.
     const args = createMockHandlerArgs({
       shouldOverride: false,
       pluginConfig: {
@@ -930,10 +925,131 @@ describe("createChatMessageHandler - auto-print panel does not depend on firstMe
     const input = createMockInput("sisyphus")
     const output = createMockOutput()
 
-    //#when
     await handler(input, output)
 
-    //#then
     expect(output.parts.find((p) => (p.text ?? "").includes("Roles · Models"))).toBeUndefined()
+  })
+})
+
+describe("createChatMessageHandler - agent handoff marker", () => {
+  beforeEach(() => {
+    resetAgentHandoffState()
+  })
+
+  test("#given the first turn of a session #when handler runs #then no handoff marker is injected", async () => {
+    const args = createMockHandlerArgs()
+    const handler = createChatMessageHandler(args)
+    const input = createMockInput("sisyphus")
+    const output = createMockOutput()
+
+    await handler(input, output)
+
+    expect(output.parts.some((p) => p.type === "text" && (p.text ?? "").includes("identity-handoff"))).toBe(false)
+  })
+
+  test("#given the same agent on two consecutive turns #when handler runs #then no marker is injected", async () => {
+    const args = createMockHandlerArgs()
+    const handler = createChatMessageHandler(args)
+    await handler(createMockInput("sisyphus"), createMockOutput())
+    const secondOutput = createMockOutput()
+
+    await handler(createMockInput("sisyphus"), secondOutput)
+
+    expect(secondOutput.parts.some((p) => p.type === "text" && (p.text ?? "").includes("identity-handoff"))).toBe(false)
+  })
+
+  test("#given the agent changes between turns #when handler runs #then a handoff marker is prepended ahead of the existing user-message parts", async () => {
+    const args = createMockHandlerArgs()
+    const handler = createChatMessageHandler(args)
+    await handler(createMockInput("sisyphus"), createMockOutput())
+
+    const input = createMockInput("hephaestus")
+    const output: ChatMessageHandlerOutput = {
+      message: {},
+      parts: [{ type: "text", text: "hi, this is my message" }],
+    }
+
+    await handler(input, output)
+
+    expect(output.parts).toHaveLength(2)
+    expect(output.parts[0].type).toBe("text")
+    expect(output.parts[0].text).toContain('<identity-handoff prior="sisyphus" current="hephaestus">')
+    expect(output.parts[0].text).toContain("You are now hephaestus")
+    expect(output.parts[0].text).toContain("authored by sisyphus")
+    expect(output.parts[1].text).toBe("hi, this is my message")
+  })
+
+  test("#given display variants of the same agent #when handler runs across turns #then no marker is injected", async () => {
+    const args = createMockHandlerArgs()
+    const handler = createChatMessageHandler(args)
+    await handler(createMockInput("hephaestus"), createMockOutput())
+
+    const input = createMockInput("Hephaestus - Deep Agent")
+    const output = createMockOutput()
+
+    await handler(input, output)
+
+    expect(output.parts.some((p) => p.type === "text" && (p.text ?? "").includes("identity-handoff"))).toBe(false)
+  })
+
+  test("#given two consecutive agent changes #when handler runs #then each transition emits its own marker", async () => {
+    const args = createMockHandlerArgs()
+    const handler = createChatMessageHandler(args)
+    await handler(createMockInput("sisyphus"), createMockOutput())
+    const transition1 = createMockOutput()
+    await handler(createMockInput("hephaestus"), transition1)
+    const transition2 = createMockOutput()
+
+    await handler(createMockInput("atlas"), transition2)
+
+    expect(transition1.parts[0].text).toContain('prior="sisyphus" current="hephaestus"')
+    expect(transition2.parts[0].text).toContain('prior="hephaestus" current="atlas"')
+  })
+
+  test("#given the injected marker part #when handler runs #then it carries id, sessionID, and messageID for the opencode schema", async () => {
+    const args = createMockHandlerArgs()
+    const handler = createChatMessageHandler(args)
+    await handler(createMockInput("sisyphus"), createMockOutput())
+    const transitionInput = createMockInput("hephaestus")
+    const output = createMockOutput()
+
+    await handler(transitionInput, output)
+
+    const marker = output.parts[0]
+    expect(marker.id).toMatch(/^prt_/)
+    expect((marker as { sessionID?: string }).sessionID).toBe("test-session")
+    expect((marker as { messageID?: string }).messageID).toBe(transitionInput.messageID)
+    expect(marker.type).toBe("text")
+  })
+
+  test("#given the dual-fire pattern #when handler runs twice with same messageID #then only the first call injects a marker", async () => {
+    const args = createMockHandlerArgs()
+    const handler = createChatMessageHandler(args)
+    await handler(createMockInput("sisyphus"), createMockOutput())
+
+    const sharedMessageID = "msg_dual_fire"
+    const realCall = createMockInput("hephaestus", undefined, sharedMessageID)
+    const staleCall = createMockInput("sisyphus", undefined, sharedMessageID)
+    const realOutput = createMockOutput()
+    const staleOutput = createMockOutput()
+
+    await handler(realCall, realOutput)
+    await handler(staleCall, staleOutput)
+
+    expect(realOutput.parts.length).toBe(1)
+    expect(realOutput.parts[0].text).toContain('prior="sisyphus" current="hephaestus"')
+    expect(staleOutput.parts.length).toBe(0)
+  })
+
+  test("#given messageID is missing on input #when handler runs across an agent transition #then injection is skipped silently", async () => {
+    const args = createMockHandlerArgs()
+    const handler = createChatMessageHandler(args)
+    await handler(createMockInput("sisyphus"), createMockOutput())
+    const input = { sessionID: "test-session", agent: "hephaestus" }
+    const output = createMockOutput()
+
+    await handler(input, output)
+
+    expect(output.parts.some((p) => p.type === "text" && (p.text ?? "").includes("identity-handoff"))).toBe(false)
   })
 })

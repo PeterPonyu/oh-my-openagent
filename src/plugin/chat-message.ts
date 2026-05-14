@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto"
+
 import type { OhMyOpenCodeConfig } from "../config"
 import type { PluginContext } from "./types"
 
@@ -8,6 +10,7 @@ import { getMainSessionID, getSessionAgent, setSessionAgent, subagentSessions } 
 import { applyUltraworkModelOverrideOnMessage } from "./ultrawork-model-override"
 import { NATIVE_LOOP_TRIGGERED_FLAG } from "./command-execute-before"
 import { maybeAutoPrintPanel, resolveOverrideModel } from "../features/roles-models"
+import { recordAgentObservation, renderHandoffMarker } from "../features/agent-handoff"
 import { parseRalphLoopArguments } from "../hooks/ralph-loop/command-arguments"
 
 import type { CreatedHooks } from "../create-hooks"
@@ -196,6 +199,20 @@ export function createChatMessageHandler(args: {
   ): Promise<void> => {
     if (input.agent) {
       setSessionAgent(input.sessionID, input.agent)
+      const priorAgent = recordAgentObservation(input.sessionID, input.agent, input.messageID)
+      // opencode rejects parts that don't carry id/sessionID/messageID, so we
+      // can only inject the marker during a real chat turn (where messageID
+      // is populated by the runtime). Without it, the transition was still
+      // recorded; we just skip the visible marker.
+      if (priorAgent && input.messageID) {
+        output.parts.unshift({
+          id: `prt_${randomUUID()}`,
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          type: "text",
+          text: renderHandoffMarker({ prior: priorAgent, current: input.agent }),
+        })
+      }
     }
 
     const isFirstMessage = firstMessageVariantGate.shouldOverride(input.sessionID)
