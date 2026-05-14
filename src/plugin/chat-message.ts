@@ -4,7 +4,7 @@ import type { PluginContext } from "./types"
 import { isModelCacheAvailable, log } from "../shared"
 import { getAgentConfigKey } from "../shared/agent-display-names"
 import { getSessionModel, setSessionModel } from "../shared/session-model-state"
-import { getMainSessionID, setSessionAgent, subagentSessions } from "../features/claude-code-session-state"
+import { getMainSessionID, getSessionAgent, setSessionAgent, subagentSessions } from "../features/claude-code-session-state"
 import { applyUltraworkModelOverrideOnMessage } from "./ultrawork-model-override"
 import { NATIVE_LOOP_TRIGGERED_FLAG } from "./command-execute-before"
 import { maybeAutoPrintPanel, resolveOverrideModel } from "../features/roles-models"
@@ -214,10 +214,15 @@ export function createChatMessageHandler(args: {
       output.message["model"] = storedMainSessionModel
     }
 
-    const pickedModel = resolveOverrideModel(
-      input.sessionID,
-      input.agent ? getAgentConfigKey(input.agent) : undefined,
-    )
+    // Resolve the agent for override lookup. Prefer input.agent (the
+    // user-selected agent for this turn) and fall back to the session's
+    // primary agent recorded earlier — opencode occasionally invokes
+    // chat.message with input.agent unset, and without the fallback an
+    // active /pick override would be silently skipped for those turns.
+    const overrideAgentKey = input.agent
+      ? getAgentConfigKey(input.agent)
+      : (getSessionAgent(input.sessionID) ? getAgentConfigKey(getSessionAgent(input.sessionID)!) : undefined)
+    const pickedModel = resolveOverrideModel(input.sessionID, overrideAgentKey)
     if (pickedModel) {
       output.message["model"] = pickedModel
     }
