@@ -6,23 +6,33 @@ import type { JSX } from "solid-js"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { useSessionRoleActivity } from "./use-session-role-activity"
 import type { RoleRow } from "./derive-row"
+import { AGENT_MODEL_REQUIREMENTS } from "../../shared/model-requirements"
 
 type Props = { session_id: string; api: TuiPluginApi }
+
+// totalCount is pure data — the canonical OMO role catalog. Hoisted out of the
+// `activity` indirection so the header renders the correct denominator on first
+// paint, before createEffect fires (D1 fix from visual QA).
+const TOTAL_COUNT = Object.keys(AGENT_MODEL_REQUIREMENTS).length
 
 export function RolesModelsSection(props: Props): JSX.Element {
   const [collapsed, setCollapsed] = createSignal<boolean>(true)
   const [expandedRows, setExpandedRows] = createSignal<Set<string>>(new Set())
 
   // Architect A4 fix: re-create the subscription when session_id changes.
+  // D1 fix: `activity` is a Solid signal (not `let`) so the JSX re-renders when
+  // the effect populates it — previously, `let activity` was non-reactive and the
+  // header stayed at `?? 0` from first paint forever.
   // createEffect re-runs whenever props.session_id mutates; Solid automatically runs
   // the previous onCleanup before re-executing the effect, so onCleanup owns teardown.
-  let activity: ReturnType<typeof useSessionRoleActivity> | undefined
+  const [activity, setActivity] = createSignal<ReturnType<typeof useSessionRoleActivity> | undefined>(undefined)
   createEffect(() => {
     const sid = props.session_id
-    activity = useSessionRoleActivity(props.api, sid)
+    const next = useSessionRoleActivity(props.api, sid)
+    setActivity(next)
     onCleanup(() => {
-      activity?.dispose()
-      activity = undefined
+      next.dispose()
+      setActivity(undefined)
     })
   })
 
@@ -36,10 +46,10 @@ export function RolesModelsSection(props: Props): JSX.Element {
   return (
     <box flexDirection="column" gap={0}>
       <text fg={theme.text} on:click={() => setCollapsed(!collapsed())}>
-        {collapsed() ? "▸" : "▾"} Roles · Models   {activity?.activeCount() ?? 0}/{activity?.totalCount() ?? 0} active
+        {collapsed() ? "▸" : "▾"} Roles · Models   {activity()?.activeCount() ?? 0}/{TOTAL_COUNT} active
       </text>
-      <Show when={!collapsed() && activity}>
-        <For each={activity!.rows()}>
+      <Show when={!collapsed() && activity()}>
+        <For each={activity()!.rows()}>
           {(row: RoleRow) => (
             <box flexDirection="column">
               <text
