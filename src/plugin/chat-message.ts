@@ -23,6 +23,7 @@ export type ChatMessageInput = {
   sessionID: string
   agent?: string
   model?: { providerID: string; modelID: string }
+  messageID?: string
 }
 type StartWorkHookOutput = { parts: Array<{ type: string; text?: string }> }
 
@@ -200,7 +201,7 @@ export function createChatMessageHandler(args: {
     const isFirstMessage = firstMessageVariantGate.shouldOverride(input.sessionID)
     if (isFirstMessage) {
       firstMessageVariantGate.markApplied(input.sessionID)
-      maybeAutoPrintPanel(input.sessionID, output, pluginConfig)
+      maybeAutoPrintPanel(input.sessionID, input.messageID, output, pluginConfig)
     }
 
     const storedMainSessionModel = getStoredMainSessionModel(
