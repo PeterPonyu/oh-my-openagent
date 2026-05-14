@@ -144,21 +144,27 @@ ${HYPERPLAN_TEMPLATE}
     },
     "show-models": {
       description: "(builtin) Show the active model + provider for each role in the current session",
+      // noReply: panel/confirmation is the entire user-visible output; no LLM call needed
+      noReply: true,
       template: `<command-instruction>
-The roles-models panel has been printed by the plugin. Acknowledge it briefly if the user asked a follow-up; otherwise stay silent.
+The roles-models panel has been printed by the plugin.
 </command-instruction>`,
     },
     pick: {
       description: "(builtin) Override the active model for a role (this session only unless --persist)",
+      // noReply: panel/confirmation is the entire user-visible output; no LLM call needed
+      noReply: true,
       template: `<command-instruction>
-The plugin has applied the model override. Acknowledge the change in one line if the user asked a follow-up; otherwise stay silent.
+The plugin has applied the model override.
 </command-instruction>`,
       argumentHint: "<role> <model> [--variant=X] [--persist]",
     },
     "auto-pick": {
       description: "(builtin) Toggle whether agents and team leaders can swap models mid-session",
+      // noReply: panel/confirmation is the entire user-visible output; no LLM call needed
+      noReply: true,
       template: `<command-instruction>
-The plugin has toggled auto-pick. Acknowledge in one line if the user asked a follow-up; otherwise stay silent.
+The plugin has toggled auto-pick.
 </command-instruction>`,
       argumentHint: "on|off",
     },

@@ -23,6 +23,8 @@ export interface CommandDefinition {
   agent?: string
   model?: string
   subtask?: boolean
+  /** Skip LLM dispatch after command output (display-only commands) — requires opencode >= 1.14.51 */
+  noReply?: boolean
   argumentHint?: string
   /** Handoff definitions for workflow transitions */
   handoffs?: HandoffDefinition[]
