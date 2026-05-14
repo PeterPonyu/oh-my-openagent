@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto"
+
 import type { OhMyOpenCodeConfig } from "../config"
 import type { PluginContext } from "./types"
 
@@ -23,6 +25,7 @@ export type ChatMessageInput = {
   sessionID: string
   agent?: string
   model?: { providerID: string; modelID: string }
+  messageID?: string
 }
 type StartWorkHookOutput = { parts: Array<{ type: string; text?: string }> }
 
@@ -196,8 +199,15 @@ export function createChatMessageHandler(args: {
     if (input.agent) {
       setSessionAgent(input.sessionID, input.agent)
       const priorAgent = recordAgentObservation(input.sessionID, input.agent)
-      if (priorAgent) {
+      // opencode rejects parts that don't carry id/sessionID/messageID, so we
+      // can only inject the marker during a real chat turn (where messageID
+      // is populated by the runtime). Without it, the transition was still
+      // recorded; we just skip the visible marker.
+      if (priorAgent && input.messageID) {
         output.parts.unshift({
+          id: `prt_${randomUUID()}`,
+          sessionID: input.sessionID,
+          messageID: input.messageID,
           type: "text",
           text: renderHandoffMarker({ prior: priorAgent, current: input.agent }),
         })
