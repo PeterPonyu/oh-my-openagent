@@ -2,6 +2,8 @@
   "compilerOptions": {
     "target": "ESNext",
     "module": "ESNext",
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid",
     "moduleResolution": "bundler",
     "declaration": true,
     "declarationDir": "dist",

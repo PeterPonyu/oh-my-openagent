@@ -1,3 +1,4 @@
+// IMPORTED BY: server, tui — keep pure data, no runtime side effects
 export type FallbackEntry = {
   providers: string[];
   model: string;
