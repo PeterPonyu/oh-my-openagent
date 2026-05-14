@@ -3,9 +3,9 @@
 import { describe, test, expect } from "bun:test"
 import { deriveRow } from "./derive-row"
 import { useSessionRoleActivity } from "./use-session-role-activity"
-import type { ModelRequirement } from "../../shared/model-requirements"
+import { AGENT_MODEL_REQUIREMENTS, type ModelRequirement } from "../../shared/model-requirements"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
-import type { Message } from "@opencode-ai/sdk/v2"
+import type { Message, Part } from "@opencode-ai/sdk/v2"
 import type { AssistantMessage } from "@opencode-ai/sdk/v2/gen/types.gen"
 import { execSync } from "node:child_process"
 import { resolve } from "node:path"
@@ -57,6 +57,7 @@ function makeMockApi(
   messages: Message[],
   agentConfig: Record<string, { model?: string }> = {},
   sessionID = "s1",
+  partsByMessageID: Record<string, Part[]> = {},
 ): { api: TuiPluginApi; fireMessageUpdated: (info: AssistantMessage, sid?: string) => void } {
   const handlers: EventHandler[] = []
 
@@ -68,6 +69,7 @@ function makeMockApi(
       session: {
         messages: (_sid: string) => messages,
       },
+      part: (messageID: string) => partsByMessageID[messageID] ?? [],
     },
     event: {
       on: (_type: string, handler: EventHandler) => {
@@ -226,6 +228,51 @@ describe("useSessionRoleActivity", () => {
     const badMsg = makeAssistantMessage("", "openai", "gpt-5", "")
     fireMessageUpdated(badMsg, "s1")
     expect(rows().length).toBe(0)
+    dispose()
+  })
+
+  test("9a. real-world Sisyphus session shape populates row with display-name agent (Defect A regression)", () => {
+    // Mirrors the QA runtime observation: agent='Sisyphus - Ultraworker', providerID='opencode-go', modelID='kimi-k2.6'
+    const msgs: Message[] = [
+      makeUserMessage(),
+      makeAssistantMessage("sisyphus", "opencode-go", "kimi-k2.6", "Sisyphus - Ultraworker"),
+    ]
+    const { api } = makeMockApi(msgs)
+    const { rows, activeCount, dispose } = useSessionRoleActivity(api, "s1")
+    expect(rows().length).toBe(1)
+    expect(rows()[0].role).toBe("Sisyphus - Ultraworker")
+    expect(rows()[0].providerID).toBe("opencode-go")
+    expect(rows()[0].modelID).toBe("kimi-k2.6")
+    expect(activeCount()).toBe(1)
+    dispose()
+  })
+
+  test("9b. totalCount equals Object.keys(AGENT_MODEL_REQUIREMENTS).length (Defect B regression)", () => {
+    const { api } = makeMockApi([])
+    const { totalCount, dispose } = useSessionRoleActivity(api, "s1")
+    const expected = Object.keys(AGENT_MODEL_REQUIREMENTS).length
+    expect(totalCount()).toBe(expected)
+    // sanity: catalog should not be empty
+    expect(expected).toBeGreaterThan(0)
+    dispose()
+  })
+
+  test("9c. AgentPart fallback resolves agent when AssistantMessage.agent is empty", () => {
+    // Build an assistant message with empty agent (worst-case host shape regression)
+    const empty = makeAssistantMessage("plan", "anthropic", "claude-opus-4-7", "")
+    const parts: Part[] = [
+      {
+        id: "prt-1",
+        sessionID: "s1",
+        messageID: empty.id,
+        type: "agent",
+        name: "sisyphus",
+      } as Part,
+    ]
+    const { api } = makeMockApi([empty], {}, "s1", { [empty.id]: parts })
+    const { rows, dispose } = useSessionRoleActivity(api, "s1")
+    expect(rows().length).toBe(1)
+    expect(rows()[0].role).toBe("sisyphus")
     dispose()
   })
 
