@@ -14,6 +14,7 @@ describe("DisplayConfigSchema", () => {
         show_models_on_fallback: false,
         auto_pick: false,
         auto_pick_budget: 2,
+        aggregate_team: false,
       })
     })
   })

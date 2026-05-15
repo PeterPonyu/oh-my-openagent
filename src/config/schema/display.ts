@@ -21,6 +21,8 @@ export const DisplayConfigSchema = z.object({
   auto_pick: z.boolean().default(false),
   /** Max model swaps an agent can make for a single role within one session. */
   auto_pick_budget: z.number().int().min(0).default(2),
+  /** Aggregate team-member sub-session role activity into the leader's Roles · Models sidebar. */
+  aggregate_team: z.boolean().default(false),
 })
 
 export type DisplayConfig = z.infer<typeof DisplayConfigSchema>

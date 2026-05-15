@@ -7,6 +7,7 @@ import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { useSessionRoleActivity } from "./use-session-role-activity"
 import type { RoleRow } from "./derive-row"
 import { AGENT_MODEL_REQUIREMENTS } from "../../shared/model-requirements"
+import { readOmoDisplayConfig } from "../../shared/read-omo-display-config"
 
 type Props = { session_id: string; api: TuiPluginApi }
 
@@ -26,9 +27,13 @@ export function RolesModelsSection(props: Props): JSX.Element {
   // createEffect re-runs whenever props.session_id mutates; Solid automatically runs
   // the previous onCleanup before re-executing the effect, so onCleanup owns teardown.
   const [activity, setActivity] = createSignal<ReturnType<typeof useSessionRoleActivity> | undefined>(undefined)
+  // B1: read `display.aggregate_team` from oh-my-openagent.json on disk. The TUI
+  // plugin runs in its own process so OMO-side runtime config isn't in api.state.
+  // The helper memoizes, so calling it once per effect run is cheap.
+  const aggregateTeam = readOmoDisplayConfig().aggregate_team
   createEffect(() => {
     const sid = props.session_id
-    const next = useSessionRoleActivity(props.api, sid)
+    const next = useSessionRoleActivity(props.api, sid, { aggregateTeam })
     setActivity(next)
     onCleanup(() => {
       next.dispose()
@@ -69,8 +74,20 @@ export function RolesModelsSection(props: Props): JSX.Element {
                   })
                 }}
               >
-                {row.role}   {row.hasEffectiveDefault && row.isOverride ? "◆" : "●"} {row.providerID}/{row.modelID}
+                {row.role}   {row.hasEffectiveDefault && row.isOverride ? "◆" : "●"} {row.providerID}/{row.modelID}{row.memberSessions && row.memberSessions.length > 1 ? ` (${row.memberOverrideCount ?? 0}/${row.memberSessions.length} members override)` : ""}
               </text>
+              {/* Aggregate-team member breakdown (F3): one muted row per team-member session
+                  when the same role was observed in >1 sub-sessions. Plain strings only —
+                  nested <text> inside <text> crashes the renderer (1db63e1a50). */}
+              <Show when={expandedRows().has(row.role) && row.memberSessions && row.memberSessions.length > 1}>
+                <For each={row.memberSessions!}>
+                  {(member) => (
+                    <text fg={theme.textMuted}>
+                      {"      "}{member.sessionID}   {member.isOverride ? "◆" : "●"} {member.providerID}/{member.modelID}
+                    </text>
+                  )}
+                </For>
+              </Show>
               <Show when={expandedRows().has(row.role) && row.hasEffectiveDefault && row.fallbackChain.length > 0}>
                 <For each={row.fallbackChain}>
                   {(entry) => (

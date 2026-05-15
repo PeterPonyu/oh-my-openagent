@@ -6046,13 +6046,18 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991
+        },
+        "aggregate_team": {
+          "default": false,
+          "type": "boolean"
         }
       },
       "required": [
         "show_models_on_session_start",
         "show_models_on_fallback",
         "auto_pick",
-        "auto_pick_budget"
+        "auto_pick_budget",
+        "aggregate_team"
       ],
       "additionalProperties": false
     },

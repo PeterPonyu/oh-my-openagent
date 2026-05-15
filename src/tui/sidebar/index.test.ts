@@ -53,13 +53,60 @@ function makeUserMessage(): Message {
 
 type EventHandler = (event: { properties: { sessionID: string; info: AssistantMessage } }) => void
 
+type MockApiOptions = {
+  agentConfig?: Record<string, { model?: string }>
+  sessionID?: string
+  partsByMessageID?: Record<string, Part[]>
+  // Aggregate-team test fixtures:
+  // messagesBySessionID overrides the per-session messages snapshot; when present it
+  // takes priority over the legacy single-array `messages` arg.
+  messagesBySessionID?: Record<string, Message[]>
+  // childrenBySessionID lets tests stub api.client.session.children for a given parent sid.
+  childrenBySessionID?: Record<string, Array<{ id: string; parentID?: string }>>
+  // parentIDBySessionID lets tests stub api.client.session.get for unknown child sids.
+  parentIDBySessionID?: Record<string, string | undefined>
+}
+
 function makeMockApi(
   messages: Message[],
-  agentConfig: Record<string, { model?: string }> = {},
-  sessionID = "s1",
-  partsByMessageID: Record<string, Part[]> = {},
-): { api: TuiPluginApi; fireMessageUpdated: (info: AssistantMessage, sid?: string) => void } {
+  agentConfigOrOptions: Record<string, { model?: string }> | MockApiOptions = {},
+  sessionIDArg?: string,
+  partsByMessageIDArg?: Record<string, Part[]>,
+): {
+  api: TuiPluginApi
+  fireMessageUpdated: (info: AssistantMessage, sid?: string) => void
+  clientGetCalls: string[]
+  clientChildrenCalls: string[]
+  unsubscribeCount: () => number
+} {
+  // Back-compat: existing tests pass (messages, agentConfig, sessionID, parts) positionally.
+  // New tests pass (messages, { ...options }).
+  const opts: MockApiOptions =
+    typeof agentConfigOrOptions === "object" && agentConfigOrOptions !== null && (
+      "messagesBySessionID" in agentConfigOrOptions ||
+      "childrenBySessionID" in agentConfigOrOptions ||
+      "parentIDBySessionID" in agentConfigOrOptions ||
+      "agentConfig" in agentConfigOrOptions ||
+      "sessionID" in agentConfigOrOptions ||
+      "partsByMessageID" in agentConfigOrOptions
+    )
+      ? (agentConfigOrOptions as MockApiOptions)
+      : {
+          agentConfig: agentConfigOrOptions as Record<string, { model?: string }>,
+          sessionID: sessionIDArg,
+          partsByMessageID: partsByMessageIDArg,
+        }
+  const agentConfig = opts.agentConfig ?? {}
+  const sessionID = opts.sessionID ?? "s1"
+  const partsByMessageID = opts.partsByMessageID ?? {}
+  const messagesBySessionID = opts.messagesBySessionID ?? {}
+  const childrenBySessionID = opts.childrenBySessionID ?? {}
+  const parentIDBySessionID = opts.parentIDBySessionID ?? {}
+
   const handlers: EventHandler[] = []
+  const clientGetCalls: string[] = []
+  const clientChildrenCalls: string[] = []
+  let totalUnsubscribed = 0
 
   const api = {
     state: {
@@ -67,7 +114,14 @@ function makeMockApi(
         agent: agentConfig,
       },
       session: {
-        messages: (_sid: string) => messages,
+        messages: (sid: string) => {
+          if (Object.prototype.hasOwnProperty.call(messagesBySessionID, sid)) {
+            return messagesBySessionID[sid]
+          }
+          // Legacy path: the single-array fixture is treated as belonging to the leader session.
+          if (sid === sessionID) return messages
+          return []
+        },
       },
       part: (messageID: string) => partsByMessageID[messageID] ?? [],
     },
@@ -76,8 +130,25 @@ function makeMockApi(
         handlers.push(handler)
         return () => {
           const idx = handlers.indexOf(handler)
-          if (idx >= 0) handlers.splice(idx, 1)
+          if (idx >= 0) {
+            handlers.splice(idx, 1)
+            totalUnsubscribed += 1
+          }
         }
+      },
+    },
+    client: {
+      session: {
+        children: async ({ sessionID: sid }: { sessionID: string }) => {
+          clientChildrenCalls.push(sid)
+          const list = childrenBySessionID[sid] ?? []
+          return { data: list }
+        },
+        get: async ({ sessionID: sid }: { sessionID: string }) => {
+          clientGetCalls.push(sid)
+          const parentID = parentIDBySessionID[sid]
+          return { data: { id: sid, parentID } }
+        },
       },
     },
     lifecycle: {
@@ -97,7 +168,18 @@ function makeMockApi(
     }
   }
 
-  return { api, fireMessageUpdated }
+  return {
+    api,
+    fireMessageUpdated,
+    clientGetCalls,
+    clientChildrenCalls,
+    unsubscribeCount: () => totalUnsubscribed,
+  }
+}
+
+function flushAsync(): Promise<void> {
+  // Allow microtasks (api.client.* fire-and-forget) to settle before assertions.
+  return new Promise((resolve) => setTimeout(resolve, 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +379,169 @@ describe("useSessionRoleActivity", () => {
     expect(rows().length).toBeGreaterThan(0)
     // Wall-clock bound is intentionally generous (2000ms) to avoid flakiness on slow CI runners
     expect(elapsed).toBeLessThan(2000)
+    dispose()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Aggregate-team mode (display.aggregate_team) — A3 nested rows + C1 loosened filter
+// ---------------------------------------------------------------------------
+
+describe("useSessionRoleActivity (aggregate_team mode)", () => {
+  test("AT1. aggregate_team=false → existing single-session behavior preserved (regression of #5)", () => {
+    const msgs: Message[] = [
+      makeUserMessage(),
+      makeAssistantMessage("plan", "anthropic", "claude-opus-4-7", "plan"),
+      makeAssistantMessage("build", "openai", "gpt-5", "build"),
+    ]
+    const { api, fireMessageUpdated } = makeMockApi(msgs)
+    const { rows, dispose } = useSessionRoleActivity(api, "s1", { aggregateTeam: false })
+    expect(rows().length).toBe(2)
+    // Cross-session event ignored when aggregation is off.
+    fireMessageUpdated(makeAssistantMessage("sisyphus", "openai", "gpt-5", "sisyphus"), "child-1")
+    expect(rows().length).toBe(2)
+    dispose()
+  })
+
+  test("AT2. aggregate_team=true with no child sessions → behaves like solo (E1 fallback)", async () => {
+    const msgs: Message[] = [
+      makeUserMessage(),
+      makeAssistantMessage("plan", "anthropic", "claude-opus-4-7", "plan"),
+    ]
+    const { api } = makeMockApi(msgs, {
+      messagesBySessionID: { s1: msgs },
+      childrenBySessionID: { s1: [] },
+    })
+    const { rows, dispose } = useSessionRoleActivity(api, "s1", { aggregateTeam: true })
+    await flushAsync()
+    expect(rows().length).toBe(1)
+    expect(rows()[0].role).toBe("plan")
+    expect(rows()[0].memberSessions).toBeUndefined()
+    dispose()
+  })
+
+  test("AT3. aggregate_team=true with two child sessions running same role → one row + memberSessions of 2", async () => {
+    const childA = "child-a"
+    const childB = "child-b"
+    const leaderMsgs: Message[] = [makeUserMessage()]
+    const msgA = makeAssistantMessage("sisyphus-junior", "anthropic", "claude-sonnet-4-6", "sisyphus-junior")
+    msgA.sessionID = childA
+    const msgB = makeAssistantMessage("sisyphus-junior", "openai", "gpt-5", "sisyphus-junior")
+    msgB.sessionID = childB
+    const { api } = makeMockApi(leaderMsgs, {
+      messagesBySessionID: {
+        s1: leaderMsgs,
+        [childA]: [msgA],
+        [childB]: [msgB],
+      },
+      childrenBySessionID: {
+        s1: [
+          { id: childA, parentID: "s1" },
+          { id: childB, parentID: "s1" },
+        ],
+      },
+    })
+    const { rows, dispose } = useSessionRoleActivity(api, "s1", { aggregateTeam: true })
+    await flushAsync()
+    expect(rows().length).toBe(1)
+    const row = rows()[0]
+    expect(row.role).toBe("sisyphus-junior")
+    expect(row.memberSessions).toBeDefined()
+    expect(row.memberSessions!.length).toBe(2)
+    const sids = row.memberSessions!.map((m) => m.sessionID).sort()
+    expect(sids).toEqual([childA, childB].sort())
+    dispose()
+  })
+
+  test("AT4. aggregate_team=true: message.updated from unknown session triggers parentID lookup; child events flow in", async () => {
+    const { api, fireMessageUpdated, clientGetCalls } = makeMockApi([], {
+      sessionID: "s1",
+      messagesBySessionID: { s1: [] },
+      childrenBySessionID: { s1: [] },
+      parentIDBySessionID: { "child-x": "s1" },
+    })
+    const { rows, dispose } = useSessionRoleActivity(api, "s1", { aggregateTeam: true })
+    await flushAsync() // settle initial children discovery
+
+    const newMsg = makeAssistantMessage("librarian", "anthropic", "claude-opus-4-7", "librarian")
+    fireMessageUpdated(newMsg, "child-x")
+    // The parentID lookup is async — flush microtasks.
+    await flushAsync()
+
+    expect(clientGetCalls).toContain("child-x")
+    expect(rows().length).toBe(1)
+    expect(rows()[0].role).toBe("librarian")
+
+    // Subsequent event from the now-known-in-scope session should NOT trigger another lookup.
+    const callsBefore = clientGetCalls.length
+    const secondMsg = makeAssistantMessage("librarian", "openai", "gpt-5", "librarian")
+    fireMessageUpdated(secondMsg, "child-x")
+    await flushAsync()
+    expect(clientGetCalls.length).toBe(callsBefore)
+    // last-write-wins on the headline observed model.
+    expect(rows()[0].providerID).toBe("openai")
+    expect(rows()[0].modelID).toBe("gpt-5")
+    dispose()
+  })
+
+  test("AT5. aggregate_team=true: cross-session event from non-child is ignored after lookup resolves", async () => {
+    const { api, fireMessageUpdated } = makeMockApi([], {
+      sessionID: "s1",
+      messagesBySessionID: { s1: [] },
+      childrenBySessionID: { s1: [] },
+      parentIDBySessionID: { stranger: undefined }, // not a child of s1
+    })
+    const { rows, dispose } = useSessionRoleActivity(api, "s1", { aggregateTeam: true })
+    await flushAsync()
+    fireMessageUpdated(makeAssistantMessage("plan", "openai", "gpt-5", "plan"), "stranger")
+    await flushAsync()
+    expect(rows().length).toBe(0)
+    dispose()
+  })
+
+  test("AT6. aggregate_team=true: dispose() unsubscribes the message.updated handler", () => {
+    const { api, unsubscribeCount } = makeMockApi([], {
+      sessionID: "s1",
+      messagesBySessionID: { s1: [] },
+      childrenBySessionID: { s1: [] },
+    })
+    const { dispose } = useSessionRoleActivity(api, "s1", { aggregateTeam: true })
+    expect(unsubscribeCount()).toBe(0)
+    dispose()
+    expect(unsubscribeCount()).toBe(1)
+  })
+
+  test("AT7. aggregate_team=true: when members run different models, ◆ aggregate marker reflects partial override", async () => {
+    const childA = "child-a"
+    const childB = "child-b"
+    const leaderMsgs: Message[] = [makeUserMessage()]
+    // Configured default: anthropic/claude-opus-4-7
+    // Child A matches → not override. Child B differs → override.
+    const msgA = makeAssistantMessage("plan", "anthropic", "claude-opus-4-7", "plan")
+    msgA.sessionID = childA
+    const msgB = makeAssistantMessage("plan", "openai", "gpt-5", "plan")
+    msgB.sessionID = childB
+    const { api } = makeMockApi(leaderMsgs, {
+      agentConfig: { plan: { model: "anthropic/claude-opus-4-7" } },
+      messagesBySessionID: {
+        s1: leaderMsgs,
+        [childA]: [msgA],
+        [childB]: [msgB],
+      },
+      childrenBySessionID: {
+        s1: [
+          { id: childA, parentID: "s1" },
+          { id: childB, parentID: "s1" },
+        ],
+      },
+    })
+    const { rows, dispose } = useSessionRoleActivity(api, "s1", { aggregateTeam: true })
+    await flushAsync()
+    expect(rows().length).toBe(1)
+    const row = rows()[0]
+    expect(row.memberSessions!.length).toBe(2)
+    expect(row.memberOverrideCount).toBe(1) // only child-b overrode
+    expect(row.isOverride).toBe(true) // aggregate marker reflects partial override
     dispose()
   })
 })
