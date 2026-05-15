@@ -4,6 +4,7 @@ import { PLUGIN_NAME } from "../shared"
 import type { InstallArgs } from "./types"
 import {
   addPluginToOpenCodeConfig,
+  addTuiPluginToTuiConfig,
   detectCurrentConfig,
   getOpenCodeVersion,
   isOpenCodeInstalled,
@@ -60,6 +61,16 @@ export async function runTuiInstaller(args: InstallArgs, version: string): Promi
     return 1
   }
   spinner.stop(`Plugin added to ${color.cyan(pluginResult.configPath)}`)
+
+  spinner.start(`Adding ${PLUGIN_NAME}/tui to OpenCode TUI config`)
+  const tuiPluginResult = await addTuiPluginToTuiConfig(version)
+  if (!tuiPluginResult.success) {
+    spinner.stop(`Failed to add TUI plugin: ${tuiPluginResult.error}`)
+    p.log.warn("TUI plugin auto-config failed — server plugin is installed, but the sidebar section won't appear until ~/.config/opencode/tui.json registers oh-my-openagent/tui manually.")
+    // Don't return 1 — server plugin already succeeded; degrade gracefully
+  } else {
+    spinner.stop(`TUI plugin added to ${color.cyan(tuiPluginResult.configPath)}`)
+  }
 
   spinner.start(`Writing ${PLUGIN_NAME} configuration`)
   const omoResult = writeOmoConfig(config)
