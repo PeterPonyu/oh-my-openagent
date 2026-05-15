@@ -45,8 +45,13 @@ export function RolesModelsSection(props: Props): JSX.Element {
 
   return (
     <box flexDirection="column" gap={0}>
-      <text fg={theme.text} on:click={() => setCollapsed(!collapsed())}>
-        {collapsed() ? "▸" : "▾"} Roles · Models   {activity()?.activeCount() ?? 0}/{TOTAL_COUNT} active
+      <text
+        fg={theme.text}
+        onMouseDown={(e) => {
+          if (e.button === 0) setCollapsed(!collapsed())
+        }}
+      >
+        {collapsed() ? "▶" : "▼"} Roles · Models   {activity()?.activeCount() ?? 0}/{TOTAL_COUNT} active
       </text>
       <Show when={!collapsed() && activity()}>
         <For each={activity()!.rows()}>
@@ -54,16 +59,17 @@ export function RolesModelsSection(props: Props): JSX.Element {
             <box flexDirection="column">
               <text
                 fg={theme.text}
-                on:click={() =>
+                onMouseDown={(e) => {
+                  if (e.button !== 0) return
                   setExpandedRows((prev) => {
                     const next = new Set(prev)
                     if (next.has(row.role)) next.delete(row.role)
                     else next.add(row.role)
                     return next
                   })
-                }
+                }}
               >
-                {row.role}   {row.hasEffectiveDefault && row.isOverride ? <text fg={theme.accent}>◆</text> : <text fg={theme.text}>●</text>} {row.providerID}/{row.modelID}
+                {row.role}   {row.hasEffectiveDefault && row.isOverride ? "◆" : "●"} {row.providerID}/{row.modelID}
               </text>
               <Show when={expandedRows().has(row.role) && row.hasEffectiveDefault && row.fallbackChain.length > 0}>
                 <For each={row.fallbackChain}>
