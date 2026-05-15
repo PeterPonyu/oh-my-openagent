@@ -12,7 +12,12 @@ const tuiPlugin: TuiPlugin = async (api, _options, _meta) => {
   // B1 fix: use mergeProps so that props.session_id is accessed via a reactive getter
   // inside RolesModelsSection, not frozen at registration time. This ensures the
   // createEffect(() => props.session_id) inside the component re-fires on session change.
+  // order: 150 places this section between Context (order=100, top) and MCP (order=200).
+  // Opencode internal sidebar plugins use these canonical orders:
+  //   context=100, mcp=200, lsp=300, todo=400, files=500
+  // (See packages/opencode/src/cli/cmd/tui/feature-plugins/sidebar/*.tsx in the host.)
   const slotId: string = api.slots.register({
+    order: 150,
     slots: {
       sidebar_content: (_ctx, props) => RolesModelsSection(mergeProps(props, { api })),
     },
