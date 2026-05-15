@@ -117,4 +117,71 @@ describe("addTuiPluginToTuiConfig", () => {
     expect(result.success).toBe(false)
     expect(result.error).toBeDefined()
   })
+
+  it("does NOT add named entry when a file: entry already provides the plugin", async () => {
+    // Simulate a dev install: a file: entry pointing at a checkout whose
+    // package.json declares one of our accepted package names.
+    const filePluginDir = join(tempDir, "local-checkout")
+    mkdirSync(filePluginDir, { recursive: true })
+    writeFileSync(
+      join(filePluginDir, "package.json"),
+      JSON.stringify({ name: "oh-my-openagent" }) + "\n"
+    )
+    writeFileSync(
+      tuiJsonPath,
+      JSON.stringify({ plugin: [`file:${filePluginDir}`] }, null, 2) + "\n"
+    )
+
+    const result = await addTuiPluginToTuiConfig("3.13.1")
+
+    expect(result.success).toBe(true)
+    const content = JSON.parse(readFileSync(tuiJsonPath, "utf-8")) as { plugin: string[] }
+    expect(content.plugin).toEqual([`file:${filePluginDir}`])
+    // No oh-my-openagent/tui duplicate appended
+    expect(content.plugin.some((p: string) => p.startsWith("oh-my-openagent/tui"))).toBe(false)
+  })
+
+  it("removes stale named entry when a file: entry already provides the plugin", async () => {
+    const filePluginDir = join(tempDir, "local-checkout")
+    mkdirSync(filePluginDir, { recursive: true })
+    writeFileSync(
+      join(filePluginDir, "package.json"),
+      JSON.stringify({ name: "oh-my-opencode" }) + "\n" // legacy name still accepted
+    )
+    writeFileSync(
+      tuiJsonPath,
+      JSON.stringify(
+        { plugin: [`file:${filePluginDir}`, "oh-my-openagent/tui@3.10.0"] },
+        null,
+        2
+      ) + "\n"
+    )
+
+    const result = await addTuiPluginToTuiConfig("3.13.1")
+
+    expect(result.success).toBe(true)
+    const content = JSON.parse(readFileSync(tuiJsonPath, "utf-8")) as { plugin: string[] }
+    expect(content.plugin).toEqual([`file:${filePluginDir}`])
+  })
+
+  it("ignores file: entries that do not point at our package", async () => {
+    const filePluginDir = join(tempDir, "third-party-plugin")
+    mkdirSync(filePluginDir, { recursive: true })
+    writeFileSync(
+      join(filePluginDir, "package.json"),
+      JSON.stringify({ name: "some-other-plugin" }) + "\n"
+    )
+    writeFileSync(
+      tuiJsonPath,
+      JSON.stringify({ plugin: [`file:${filePluginDir}`] }, null, 2) + "\n"
+    )
+
+    const result = await addTuiPluginToTuiConfig("3.13.1")
+
+    expect(result.success).toBe(true)
+    const content = JSON.parse(readFileSync(tuiJsonPath, "utf-8")) as { plugin: string[] }
+    // file: entry stays AND named entry is appended (third-party doesn't satisfy ours)
+    expect(content.plugin).toContain(`file:${filePluginDir}`)
+    expect(content.plugin).toContain("oh-my-openagent/tui@latest")
+  })
 })
