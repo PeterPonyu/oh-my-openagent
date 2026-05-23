@@ -35,6 +35,7 @@ import { shouldRetryError } from "../shared/model-error-classifier";
 import { buildFallbackChainFromModels } from "../shared/fallback-chain-from-models";
 import { extractRetryAttempt, normalizeRetryStatusMessage } from "../shared/retry-status-utils";
 import { clearSessionModel, getSessionModel, setSessionModel } from "../shared/session-model-state";
+import { resolveCompactionModel } from "../hooks/shared/compaction-model-resolver";
 import { clearSessionPromptParams } from "../shared/session-prompt-params-state";
 import { deleteSessionTools } from "../shared/session-tools-store";
 import { dispatchOpenClawEvent } from "../openclaw/runtime-dispatch";
@@ -954,11 +955,17 @@ export function createEventHandler(args: {
             sessionID === getMainSessionID() &&
             !hooks.stopContinuationGuard?.isStopped(sessionID)
           ) {
-            // Trigger compaction before sending "continue" to avoid double-sending continuation
+            const sessionModel = getSessionModel(sessionID)
+            const compactionModel = sessionModel
+              ? resolveCompactionModel(pluginConfig, sessionID, sessionModel.providerID, sessionModel.modelID)
+              : null
+            const summarizeBody = compactionModel
+              ? { providerID: compactionModel.providerID, modelID: compactionModel.modelID }
+              : { auto: true }
             await pluginContext.client.session
               .summarize({
                 path: { id: sessionID },
-                body: { auto: true },
+                body: summarizeBody,
                 query: { directory: pluginContext.directory },
               })
               .catch((err: unknown) => {
