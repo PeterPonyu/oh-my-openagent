@@ -960,7 +960,7 @@ export function createEventHandler(args: {
               ? resolveCompactionModel(pluginConfig, sessionID, sessionModel.providerID, sessionModel.modelID)
               : null
             const summarizeBody = compactionModel
-              ? { providerID: compactionModel.providerID, modelID: compactionModel.modelID }
+              ? { providerID: compactionModel.providerID, modelID: compactionModel.modelID, auto: true }
               : { auto: true }
             await pluginContext.client.session
               .summarize({
