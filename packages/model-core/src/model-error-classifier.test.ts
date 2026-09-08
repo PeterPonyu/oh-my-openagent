@@ -495,6 +495,13 @@ describe("model-error-classifier", () => {
       const error = { name: "messageabortederror" }
       expect(shouldRetryError(error)).toBe(false)
     })
+
+    test("treats UnknownError plus STOP quota message as non-retryable", () => {
+      //#given: UnknownError is an opaque wrapper, not a named retry class.
+      // Quota text must still terminate instead of advancing fallback.
+      const error = { name: "UnknownError", message: "quota exceeded for this billing period" }
+      expect(isRetryableModelError(error)).toBe(false)
+    })
   })
 })
 

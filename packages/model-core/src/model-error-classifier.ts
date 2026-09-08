@@ -12,10 +12,6 @@ const RETRYABLE_ERROR_NAMES = new Set([
   "modelunavailableerror",
   "providerconnectionerror",
   "authenticationerror",
-  // Generic catch-all. SDKs occasionally surface failures with name="UnknownError"
-  // when they cannot classify a provider response. Without this entry the
-  // fallback chain never advances and the task dies on the first opaque error.
-  "unknownerror",
 ])
 
 const STOP_ERROR_NAMES = new Set([
@@ -174,6 +170,10 @@ export function isRetryableModelError(error: ErrorInfo): boolean {
   // STOP patterns take precedence over retryable patterns
   if (STOP_MESSAGE_PATTERNS.some((pattern) => msg.includes(pattern))) {
     return false
+  }
+
+  if (error.name?.toLowerCase() === "unknownerror") {
+    return true
   }
 
   if (hasProviderAutoRetrySignal(msg)) {
