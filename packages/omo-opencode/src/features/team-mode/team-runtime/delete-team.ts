@@ -177,11 +177,12 @@ async function deleteTeamResources(
   const removedWorktrees = await removeWorktrees(runtimeState.members.map((member) => member.worktreePath))
 
   if (runtimeState.status !== "deleted") {
+    // under force the status may have raced to orphaned (no FSM edge to deleted) after the worktrees were already removed
     await transitionRuntimeState(teamRunId, (currentRuntimeState) => (
       currentRuntimeState.status === "deleted"
         ? currentRuntimeState
         : { ...currentRuntimeState, status: "deleted" }
-    ), config)
+    ), config, options?.force === true ? { force: true } : undefined)
   }
 
   await removeWorktrees([getRuntimeStateDir(resolveBaseDir(config), teamRunId)])

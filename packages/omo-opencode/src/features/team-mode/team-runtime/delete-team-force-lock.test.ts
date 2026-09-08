@@ -83,7 +83,7 @@ describe("deleteTeam force path takes state.lock", () => {
         { status: "deleting", lockOwner: lockedByStateStore },
         { status: "deleted", lockOwner: lockedByStateStore },
       ])
-      expect(transitionOptions).toEqual([undefined, { force: true }, undefined])
+      expect(transitionOptions).toEqual([undefined, { force: true }, { force: true }])
       await expectRuntimeDirectoryRemoved(fixture.teamRunId, fixture.config)
     },
   )
@@ -139,6 +139,37 @@ describe("deleteTeam force path takes state.lock", () => {
       { status: "deleting", whileHolderHeldLock: false },
       { status: "deleted", whileHolderHeldLock: false },
     ])
+    await expectRuntimeDirectoryRemoved(fixture.teamRunId, fixture.config)
+  })
+
+  test("force delete of a 'creating' team still lands the final deleted write when the status races to orphaned behind the deleting write", async () => {
+    // given
+    const fixture = await createFixture({ status: "creating" })
+    temporaryDirectories.push(fixture.baseDir)
+    const transitionOptions: Array<{ readonly force?: boolean } | undefined> = []
+    const originalTransitionRuntimeState = runtimeStateStore.transitionRuntimeState
+    spyOn(runtimeStateStore, "transitionRuntimeState").mockImplementation(async (teamRunId, transition, config, options) => {
+      transitionOptions.push(options)
+      const nextRuntimeState = await originalTransitionRuntimeState(teamRunId, transition, config, options)
+      // the orphan handler may flip any status to orphaned, and orphaned has no FSM edge to deleted
+      if (nextRuntimeState.status === "deleting") {
+        await originalTransitionRuntimeState(teamRunId, (currentRuntimeState) => ({ ...currentRuntimeState, status: "orphaned" }), config)
+      }
+      return nextRuntimeState
+    })
+    const savedStatuses: string[] = []
+    const originalSaveRuntimeState = runtimeStateStore.saveRuntimeState
+    spyOn(runtimeStateStore, "saveRuntimeState").mockImplementation(async (runtimeState, config) => {
+      savedStatuses.push(runtimeState.status)
+      return await originalSaveRuntimeState(runtimeState, config)
+    })
+
+    // when
+    await deleteTeam(fixture.teamRunId, fixture.config, undefined, undefined, { force: true })
+
+    // then
+    expect(savedStatuses).toEqual(["creating", "deleting", "orphaned", "deleted"])
+    expect(transitionOptions).toEqual([undefined, { force: true }, { force: true }])
     await expectRuntimeDirectoryRemoved(fixture.teamRunId, fixture.config)
   })
 })
