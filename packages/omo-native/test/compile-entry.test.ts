@@ -318,7 +318,7 @@ describe("embedded runtime provisioning", () => {
     process.exitCode = undefined
     try {
       await runCompiledLauncher(["doctor"], root, "2026.8.28", root)
-      doctorExitCode = process.exitCode
+      doctorExitCode = process.exitCode as string | number | undefined
     } finally {
       console.log = originalLog
       process.exitCode = originalExitCode

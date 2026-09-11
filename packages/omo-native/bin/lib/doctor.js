@@ -69,6 +69,7 @@ function readDistTags(options) {
 // payload, not every skill. x-search is the exception because it is credential-gated
 // (not under plugin/skills) and a missing copy used to pass doctor while senpi
 // reported a Skill conflict on every xAI session (#7774).
+/** @type {ReadonlyArray<readonly [string, string]>} */
 export const DOCTOR_PLUGIN_ARTIFACTS = [
   ["plugin manifest", "plugin/package.json"],
   ["extension", "plugin/extensions/omo.js"],
