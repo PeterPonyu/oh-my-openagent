@@ -2,6 +2,9 @@ import type { GitTreeSizedEntry } from "@oh-my-opencode/memory-core"
 
 import type { SenpiExtensionAPI } from "../../extension/types"
 import type { MemoryIdentityContext } from "./context"
+import { MEMORY_FACTS_APPLY_RPC_METHOD, type MemoryFactsApplier } from "./facts-apply-rpc"
+import { MEMORY_REFLECTIONS_RPC_METHOD, readMemoryReflections } from "./memory-rpc-reflections"
+export { MEMORY_REFLECTIONS_RPC_METHOD } from "./memory-rpc-reflections"
 import {
   buildMemorySnapshot,
   createMemoryRpcGitRepo,
@@ -86,6 +89,8 @@ export interface MemoryRpcBridgeDeps {
   /** Lane E's active-run tracking: the run currently in flight for the identity, if any. */
   readonly activeRun: (identity: string) => MemoryRpcActiveRun | undefined
   readonly createGitRepo?: (repoPath: string) => MemoryRpcGitRepo
+  /** `omo.memory.facts.apply`: the facts extractor's apply for the bound session; absent registers nothing. */
+  readonly applyFacts?: MemoryFactsApplier
 }
 
 export interface MemoryRpcBridge {
@@ -116,6 +121,7 @@ export function createMemoryRpcBridge(
   let sessionId: string | undefined
   let lastSnapshot: string | undefined
   let disposed = false
+  let bindingGeneration = 0
 
   function repoFor(context: MemoryIdentityContext): MemoryRpcGitRepo {
     const cached = repos.get(context.identityPaths.repo)
@@ -139,30 +145,58 @@ export function createMemoryRpcBridge(
   }
 
   registerStatusHandler(pi, buildSnapshot)
+  pi.rpc?.handle?.(MEMORY_REFLECTIONS_RPC_METHOD, async (request) => {
+    const boundSession = sessionId
+    const generation = bindingGeneration
+    const context = boundSession === undefined ? undefined : deps.resolveContext(boundSession)
+    if (disposed || boundSession === undefined || context === undefined) {
+      return { kind: "unavailable", reason: "No bound memory session." }
+    }
+    const page = await readMemoryReflections(context, boundSession, request)
+    if (disposed || generation !== bindingGeneration || context !== deps.resolveContext(boundSession)) {
+      return { kind: "unavailable", reason: "Memory session binding changed." }
+    }
+    return page
+  })
+
+  const applyFacts = deps.applyFacts
+  if (applyFacts !== undefined) {
+    pi.rpc?.handle?.(MEMORY_FACTS_APPLY_RPC_METHOD, async (request) => {
+      if (disposed || sessionId === undefined) return { kind: "unavailable", reason: "No bound memory session." }
+      const applied = await applyFacts(request, sessionId)
+      if ("outcome" in applied && applied.outcome === "committed") await publishSnapshot()
+      return applied
+    })
+  }
+
+  async function publishSnapshot(): Promise<void> {
+    if (disposed || pi.rpc?.emit === undefined) return
+    const snapshot = await buildSnapshot()
+    if (snapshot === undefined) return
+    const fingerprint = JSON.stringify(snapshot)
+    if (fingerprint === lastSnapshot) return
+    lastSnapshot = fingerprint
+    pi.rpc.emit(MEMORY_UPDATED_RPC_EVENT, snapshot)
+  }
 
   return {
     attach(nextSessionId) {
       if (disposed) return
       sessionId = nextSessionId
+      bindingGeneration++
       lastSnapshot = undefined
     },
 
-    async sync() {
-      if (disposed || pi.rpc?.emit === undefined) return
-      const snapshot = await buildSnapshot()
-      if (snapshot === undefined) return
-      const fingerprint = JSON.stringify(snapshot)
-      if (fingerprint === lastSnapshot) return
-      lastSnapshot = fingerprint
-      pi.rpc.emit(MEMORY_UPDATED_RPC_EVENT, snapshot)
-    },
+    sync: publishSnapshot,
 
     detach() {
+      bindingGeneration++
       sessionId = undefined
       lastSnapshot = undefined
     },
 
     dispose() {
+      bindingGeneration++
       disposed = true
       sessionId = undefined
       lastSnapshot = undefined
