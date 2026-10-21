@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Config load now warns when `agents.<name>` targets a name outside the built-in agent list and sets `prompt`, `prompt_append`, or `mode`: those fields only take effect for built-in agents (custom-agent prompts belong in an opencode-native `~/.config/opencode/agent/<name>.md` file), so they were silently dropped while `model`/`variant`/`fallback_models` on the same entry kept working. The mismatch now surfaces through the config-error channel instead of failing as an unexplained no-op. (#8143)
+- Config load now warns when `agents.<name>` targets a name outside the built-in agent list and sets `prompt`, `prompt_append`, or `mode`: those fields only take effect for built-in agents (custom-agent prompts belong in an opencode-native `~/.config/opencode/agent/<name>.md` file), so they were silently dropped while `model`/`variant`/`fallback_models` on the same entry kept working. The mismatch now surfaces through the config-error channel instead of failing as an unexplained no-op. ([#8143](https://github.com/code-yeongyu/oh-my-openagent/issues/8143), [#8151](https://github.com/code-yeongyu/oh-my-openagent/pull/8151))
 
 **The launcher deletes a legacy `~/.omo/credentials.json` left by an intermediate sign-in build.** The file held the device's private keys and account refresh material in plaintext, sometimes world-readable; upgrading removes it. Only the exact legacy shape is removed. ([#10697](https://github.com/code-yeongyu/oh-my-openagent/issues/10697), [#10698](https://github.com/code-yeongyu/oh-my-openagent/pull/10698))
 
