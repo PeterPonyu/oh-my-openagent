@@ -239,7 +239,10 @@ describe("runtime state store", () => {
     // then
     expect(runtimeState.status).toBe("deleting")
     expect((await loadRuntimeState(createdState.teamRunId, config)).status).toBe("deleting")
-    expect(lockOwnerDuringTransition).toEqual(["team-state-store", String(process.pid)])
+    expect(lockOwnerDuringTransition).toEqual([
+      expect.stringMatching(/^team-state-store [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+      String(process.pid),
+    ])
     expect(existsSync(lockPath)).toBe(false)
   })
 

@@ -77,7 +77,7 @@ describe("deleteTeam force path takes state.lock", () => {
       await deleteTeam(fixture.teamRunId, fixture.config, undefined, undefined, { force: true })
 
       // then
-      const lockedByStateStore = ["team-state-store", String(process.pid)]
+      const lockedByStateStore = [expect.stringMatching(/^team-state-store [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i), String(process.pid)]
       expect(saves).toEqual([
         { status, lockOwner: lockedByStateStore },
         { status: "deleting", lockOwner: lockedByStateStore },
