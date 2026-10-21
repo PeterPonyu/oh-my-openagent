@@ -6,7 +6,7 @@
     "prepare": "node ./scripts/generate-docs-content.mjs",
     "prebuild": "node ./scripts/prepare-build.mjs",
     "dev": "next dev",
-    "build": "next build",
+    "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint \"app/**/*.{ts,tsx}\" \"components/**/*.{ts,tsx}\" \"lib/**/*.{ts,tsx}\" \"e2e/**/*.{ts,tsx}\"",
     "lint:fix": "eslint --fix \"app/**/*.{ts,tsx}\" \"components/**/*.{ts,tsx}\" \"lib/**/*.{ts,tsx}\" \"e2e/**/*.{ts,tsx}\"",
@@ -30,7 +30,7 @@
     "lucide-react": "0.577.0",
     "marked": "^18.0.3",
     "motion": "^12.38.0",
-    "next": "15.5.18",
+    "next": "16.3.6",
     "next-intl": "^4.11.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
@@ -43,16 +43,27 @@
     "safari >= 15",
     "edge >= 100"
   ],
+  "overrides": {
+    "brace-expansion": "5.0.6",
+    "fast-xml-parser": "5.7.3",
+    "flatted": "3.4.2",
+    "minimatch": "10.2.4",
+    "path-to-regexp": "8.4.2",
+    "picomatch": "4.0.4",
+    "postcss": "8.5.14",
+    "qs": "6.15.1",
+    "yaml": "2.9.0"
+  },
   "devDependencies": {
-    "@opennextjs/cloudflare": "^1.19.8",
+    "@opennextjs/cloudflare": "^1.19.9",
     "@playwright/test": "1.59.1",
     "@tailwindcss/postcss": "4.2.4",
-    "@types/node": "^25.6.2",
+    "@types/node": "^25.7.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "critters": "^0.0.25",
     "eslint": "^10.3.0",
-    "eslint-config-next": "15.5.18",
+    "eslint-config-next": "16.3.6",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.5",
     "globals": "^17.6.0",
@@ -61,7 +72,7 @@
     "prettier-plugin-tailwindcss": "^0.8.0",
     "tailwindcss": "4.2.4",
     "typescript": "6.0.3",
-    "typescript-eslint": "^8.59.2",
+    "typescript-eslint": "^8.59.3",
     "wrangler": "^4.90.0"
   }
 }

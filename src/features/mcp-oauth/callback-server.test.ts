@@ -30,6 +30,8 @@ describe("startCallbackServer", () => {
   let server: CallbackServer | null = null
   let serveSpy: ReturnType<typeof spyOn> | null = null
   let activeServer: MockServerState | null = null
+  let originalNoProxy: string | undefined
+  let originalUpperNoProxy: string | undefined
 
   async function request(url: string): Promise<Response> {
     if (canBindRealSockets) {
@@ -44,6 +46,14 @@ describe("startCallbackServer", () => {
   }
 
   beforeEach(() => {
+    originalNoProxy = process.env.no_proxy
+    originalUpperNoProxy = process.env.NO_PROXY
+    // Requests to this local test server must not go through an inherited proxy.
+    process.env.no_proxy = [originalNoProxy, originalUpperNoProxy, "127.0.0.1,localhost,::1"]
+      .filter(Boolean)
+      .join(",")
+    process.env.NO_PROXY = process.env.no_proxy
+
     if (canBindRealSockets) {
       return
     }
@@ -84,6 +94,10 @@ describe("startCallbackServer", () => {
       serveSpy = null
     }
     activeServer = null
+    if (originalNoProxy === undefined) delete process.env.no_proxy
+    else process.env.no_proxy = originalNoProxy
+    if (originalUpperNoProxy === undefined) delete process.env.NO_PROXY
+    else process.env.NO_PROXY = originalUpperNoProxy
 
     if (canBindRealSockets) {
       await Bun.sleep(10)

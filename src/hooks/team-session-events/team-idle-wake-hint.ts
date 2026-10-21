@@ -7,8 +7,9 @@ import {
   applyMemberSessionRouting,
   buildMemberPromptBody,
 } from "../../features/team-mode/member-session-routing"
+import { resolveSessionEventID } from "../../shared/event-session-id"
 import { log } from "../../shared/logger"
-import { settleAfterSessionIdle } from "../shared/session-idle-settle"
+import { shouldPromptAfterSessionIdle } from "../shared/session-idle-settle"
 
 type PromptAsyncInput = {
   path: { id: string }
@@ -26,6 +27,7 @@ type TeamIdleWakeHintContext = {
   client: {
     session: {
       promptAsync?: (input: PromptAsyncInput) => Promise<unknown>
+      status?: () => Promise<unknown>
     }
   }
 }
@@ -35,8 +37,7 @@ export type HookImpl = (input: HookInput) => Promise<void>
 type TeamIdleWakeHintOptions = { idleSettleMs?: number }
 
 function getIdleSessionID(properties: unknown): string | undefined {
-  const record = properties as { sessionID?: string } | undefined
-  return record?.sessionID
+  return resolveSessionEventID(properties)
 }
 
 function buildWakeHint(unreadCount: number): string {
@@ -99,7 +100,16 @@ export function createTeamIdleWakeHint(ctx: TeamIdleWakeHintContext, config: Tea
       }
 
       applyMemberSessionRouting(sessionID, memberEntry)
-      await settleAfterSessionIdle(options?.idleSettleMs)
+      if (!(await shouldPromptAfterSessionIdle(ctx.client, sessionID, options?.idleSettleMs))) {
+        log("team idle wake hint skipped because session is active", {
+          event: "team-mode-idle-wake-hint-active-session",
+          teamRunId: runtimeState.teamRunId,
+          memberName: memberEntry.name,
+          sessionID,
+          unreadCount: unreadMessages.length,
+        })
+        return
+      }
 
       await ctx.client.session.promptAsync({
         path: { id: sessionID },

@@ -288,6 +288,7 @@ describe("runtime state store", () => {
     expect(activeTeams).toEqual([])
     expect(await runtimeDirectoryExists(baseDir, runtimeState.teamRunId)).toBe(false)
   })
+
 })
 
 describe("assertTeamServedByCurrentInstance", () => {

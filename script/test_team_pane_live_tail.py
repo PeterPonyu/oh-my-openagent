@@ -111,6 +111,15 @@ class SessionStateUrlNormalizationTests(unittest.TestCase):
         self.assertEqual(strict.ssl_context.verify_mode, mod.ssl.CERT_REQUIRED)
         self.assertEqual(insecure.ssl_context.verify_mode, mod.ssl.CERT_NONE)
 
+    def test_open_url_merges_basic_auth_with_existing_headers(self) -> None:
+        state = mod.SessionState("http://x", "ses_y")
+        with patch.dict(mod.os.environ, {"OPENCODE_SERVER_PASSWORD": "secret"}, clear=False):
+            with patch.object(mod.urllib.request, "urlopen") as urlopen:
+                state.open_url("http://x/event", headers={"Accept": "text/event-stream"})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.headers["Accept"], "text/event-stream")
+        self.assertTrue(request.headers["Authorization"].startswith("Basic "))
+
 
 class SessionStateFetchTests(unittest.TestCase):
     def _mock_session_response(self, payload: dict) -> patch:
@@ -154,6 +163,69 @@ class SessionStateFetchTests(unittest.TestCase):
 
 
 class HandleEventTests(unittest.TestCase):
+    def test_live_deltas_and_completed_snapshot_render_each_chunk_once(self) -> None:
+        state = mod.SessionState("http://x", "ses_y")
+        state.role_by_message["m1"] = "ASSISTANT"
+        seen = state.seen_parts
+        def delta(text):
+            return {"type": "message.part.delta", "properties": {
+                "messageID": "m1", "partID": "p1", "field": "text", "delta": text,
+            }}
+        snapshot = [{"info": {"id": "m1", "role": "assistant"}, "parts": [
+            {"id": "p1", "type": "text", "messageID": "m1", "text": "prefix suffix"},
+        ]}]
+        with patch("sys.stdout", new=StringIO()) as output:
+            mod.handle_event(delta("prefix"), state, seen)
+            mod.handle_event(delta(" suffix"), state, seen)
+            mod._render_polled_messages(snapshot, state, seen, state.seen_status, state.seen_finish)
+        self.assertEqual(output.getvalue().count("prefix"), 1)
+        self.assertEqual(output.getvalue().count("suffix"), 1)
+
+    def test_completed_snapshot_before_queued_delta_does_not_duplicate_suffix(self) -> None:
+        state = mod.SessionState("http://x", "ses_y")
+        seen = state.seen_parts
+        def delta(text):
+            return {"type": "message.part.delta", "properties": {
+                "messageID": "m1", "partID": "p1", "field": "text", "delta": text,
+            }}
+        with patch("sys.stdout", new=StringIO()) as output:
+            mod.handle_event(delta("prefix"), state, seen)
+            mod._render_polled_messages([
+                {"info": {"id": "m1", "role": "assistant"}, "parts": [
+                    {"id": "p1", "type": "text", "messageID": "m1", "text": "prefix suffix"},
+                ]},
+            ], state, seen, state.seen_status, state.seen_finish)
+            mod.handle_event(delta(" suffix"), state, seen)
+        self.assertEqual(output.getvalue().count("prefix"), 1)
+        self.assertEqual(output.getvalue().count("suffix"), 1)
+
+    def test_reasoning_delta_keeps_part_type(self) -> None:
+        state = mod.SessionState("http://x", "ses_y")
+        with patch("sys.stdout", new=StringIO()) as output:
+            mod.handle_event({"type": "message.part.updated", "properties": {"part": {
+                "id": "p1", "type": "reasoning", "messageID": "m1", "text": "",
+            }}}, state, state.seen_parts)
+            mod.handle_event({"type": "message.part.delta", "properties": {
+                "messageID": "m1", "partID": "p1", "field": "text", "delta": "considering",
+            }}, state, state.seen_parts)
+        self.assertIn("REASONING", output.getvalue())
+        self.assertIn("considering", output.getvalue())
+
+    def test_queued_running_event_does_not_regress_completed_snapshot(self) -> None:
+        state = mod.SessionState("http://x", "ses_y")
+        part = {"id": "p1", "type": "tool", "messageID": "m1", "tool": "grep",
+                "state": {"status": "completed"}}
+        with patch("sys.stdout", new=StringIO()) as output:
+            mod._render_polled_messages(
+                [{"info": {"id": "m1", "role": "assistant"}, "parts": [part]}],
+                state, state.seen_parts, state.seen_status, state.seen_finish,
+            )
+            mod.handle_event({"type": "message.part.updated", "properties": {"part": {
+                **part, "state": {"status": "running"},
+            }}}, state, state.seen_parts)
+        self.assertIn("grep → completed", output.getvalue())
+        self.assertNotIn("grep → running", output.getvalue())
+
     def test_user_role_text_renders_as_user(self) -> None:
         state = mod.SessionState("http://x", "ses_y")
         state.role_by_message["msg1"] = "USER"
@@ -209,19 +281,151 @@ class HandleEventTests(unittest.TestCase):
         # Only one render despite two events of the same length.
         self.assertEqual(fake.getvalue().count("Hello"), 1)
 
+    def test_text_delta_renders_live_increment(self) -> None:
+        state = mod.SessionState("http://x", "ses_y")
+        state.role_by_message["msg1"] = "ASSISTANT"
+        seen: dict = {}
+        ev = {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionId": "ses_y",
+                "messageID": "msg1",
+                "partID": "part1",
+                "field": "text",
+                "delta": "streaming chunk",
+            },
+        }
+        with patch("sys.stdout", new=StringIO()) as fake:
+            mod.handle_event(ev, state, seen)
+        self.assertIn("ASSISTANT", fake.getvalue())
+        self.assertIn("streaming chunk", fake.getvalue())
+
 
 class MatchSessionTests(unittest.TestCase):
+    def test_matches_via_top_level_sessionId(self) -> None:
+        ev = {"properties": {"sessionId": "ses_abc"}}
+        self.assertTrue(mod.match_session(ev, "ses_abc"))
+
     def test_matches_via_part_sessionID(self) -> None:
         ev = {"properties": {"part": {"sessionID": "ses_abc"}}}
+        self.assertTrue(mod.match_session(ev, "ses_abc"))
+
+    def test_matches_via_part_sessionId(self) -> None:
+        ev = {"properties": {"part": {"sessionId": "ses_abc"}}}
         self.assertTrue(mod.match_session(ev, "ses_abc"))
 
     def test_matches_via_info_sessionID(self) -> None:
         ev = {"properties": {"info": {"sessionID": "ses_abc"}}}
         self.assertTrue(mod.match_session(ev, "ses_abc"))
 
+    def test_matches_via_info_sessionId(self) -> None:
+        ev = {"properties": {"info": {"sessionId": "ses_abc"}}}
+        self.assertTrue(mod.match_session(ev, "ses_abc"))
+
+    def test_does_not_match_message_id_as_session_id(self) -> None:
+        ev = {"properties": {"info": {"id": "ses_abc"}}}
+        self.assertFalse(mod.match_session(ev, "ses_abc"))
+
     def test_rejects_other_session(self) -> None:
         ev = {"properties": {"info": {"sessionID": "ses_other"}}}
         self.assertFalse(mod.match_session(ev, "ses_abc"))
+
+
+class SessionEventReaderTests(unittest.TestCase):
+    def test_retries_a_disconnected_stream_until_stopped(self) -> None:
+        import queue
+        import threading
+
+        state = mod.SessionState("http://x", "ses_y")
+        stop = threading.Event()
+        with patch.object(state, "open_url", side_effect=ConnectionResetError("disconnected")) as open_url:
+            with patch.object(stop, "wait", side_effect=lambda delay: stop.set()) as wait:
+                mod.read_session_events(state, queue.Queue(), stop)
+        open_url.assert_called_once()
+        wait.assert_called_once_with(1)
+
+    def test_queues_only_matching_session_and_ignores_invalid_frames(self) -> None:
+        import io
+        import queue
+        import threading
+
+        state = mod.SessionState("http://x/", "ses_y")
+        events = queue.Queue()
+        stop = threading.Event()
+        wanted = {"type": "message.part.delta", "properties": {"sessionID": "ses_y"}}
+        other = {"type": "message.part.delta", "properties": {"sessionID": "ses_other"}}
+        response = io.BytesIO(b"data: broken\n\ndata: []\n\n" +
+                              b"data: " + json.dumps(other).encode() + b"\n\n" +
+                              b"data: " + json.dumps({"payload": wanted}).encode() + b"\n\n")
+        with patch.object(state, "open_url", return_value=response) as open_url:
+            with patch.object(stop, "wait", side_effect=lambda delay: stop.set()):
+                mod.read_session_events(state, events, stop)
+        self.assertEqual(events.get_nowait(), wanted)
+        self.assertTrue(events.empty())
+        open_url.assert_called_once_with("http://x/event", timeout=15, headers={"Accept": "text/event-stream"})
+
+
+class PolledMessageRendererTests(unittest.TestCase):
+    """Validate the message snapshot fallback and shared renderer."""
+
+    def _render(self, msgs: list) -> tuple[str, dict, dict, set]:
+        state = mod.SessionState("http://x", "ses_poll")
+        seen_parts: dict = {}
+        seen_status: dict = {}
+        seen_finish: set = set()
+        out = StringIO()
+        with patch("sys.stdout", out):
+            mod._render_polled_messages(msgs, state, seen_parts, seen_status, seen_finish)
+        return out.getvalue(), seen_parts, seen_status, seen_finish
+
+    def test_renders_text_growth_as_delta(self) -> None:
+        # First poll sees "Hello"; second poll sees "Hello world".
+        state = mod.SessionState("http://x", "ses_poll")
+        seen_parts: dict = {}
+        out = StringIO()
+        with patch("sys.stdout", out):
+            mod._render_polled_messages(
+                [{"info": {"id": "m1", "role": "assistant"}, "parts": [{"id": "p1", "type": "text", "messageID": "m1", "text": "Hello"}]}],
+                state, seen_parts, {}, set(),
+            )
+            mod._render_polled_messages(
+                [{"info": {"id": "m1", "role": "assistant"}, "parts": [{"id": "p1", "type": "text", "messageID": "m1", "text": "Hello world"}]}],
+                state, seen_parts, {}, set(),
+            )
+        text = out.getvalue()
+        self.assertIn("Hello", text)
+        # The second render should only print " world" (the new tail), not "Hello" again.
+        # Strip ANSI to count substrings reliably.
+        import re as _re
+        plain = _re.sub(r"\x1b\[[0-9;]*m", "", text)
+        self.assertEqual(plain.count("Hello"), 1, f"expected one 'Hello' print, got: {plain!r}")
+        self.assertIn(" world", plain)
+
+    def test_renders_tool_status_transition_once(self) -> None:
+        state = mod.SessionState("http://x", "ses_poll")
+        seen_status: dict = {}
+        out = StringIO()
+        msg = {
+            "info": {"id": "m1", "role": "assistant"},
+            "parts": [{"id": "p1", "type": "tool", "messageID": "m1", "tool": "grep", "state": {"status": "running"}}],
+        }
+        with patch("sys.stdout", out):
+            # Two polls with the same running status — only first should print.
+            mod._render_polled_messages([msg], state, {}, seen_status, set())
+            mod._render_polled_messages([msg], state, {}, seen_status, set())
+        plain = out.getvalue()
+        self.assertEqual(plain.count("grep → running"), 1)
+
+    def test_renders_finish_once(self) -> None:
+        state = mod.SessionState("http://x", "ses_poll")
+        seen_finish: set = set()
+        out = StringIO()
+        msg = {"info": {"id": "m1", "role": "assistant", "finish": "stop"}, "parts": []}
+        with patch("sys.stdout", out):
+            mod._render_polled_messages([msg], state, {}, {}, seen_finish)
+            mod._render_polled_messages([msg], state, {}, {}, seen_finish)
+        plain = out.getvalue()
+        self.assertEqual(plain.count("finish=stop"), 1)
 
 
 class ReconnectWallclockBudgetTests(unittest.TestCase):
@@ -236,18 +440,18 @@ class ReconnectWallclockBudgetTests(unittest.TestCase):
 
         state.open_url = always_fail  # type: ignore[method-assign]
 
-        opts = mod._StreamOpts(
-            idle_heartbeat_seconds=30,
+        opts = mod._PollOpts(
+            poll_interval_seconds=1.0,
             max_reconnect_wallclock_seconds=2,
         )
 
         start = _time.monotonic()
-        result = mod.stream_events(state, opts)
+        result = mod.poll_session_messages(state, opts)
         elapsed = _time.monotonic() - start
 
-        self.assertEqual(result, 1, "stream_events should return 1 after budget exhaustion")
+        self.assertEqual(result, 1, "poll_session_messages should return 1 after budget exhaustion")
         # Budget is 2s; the first backoff delay is 2s so it fires after one sleep.
-        self.assertLess(elapsed, 10.0, f"stream_events took too long: {elapsed:.1f}s")
+        self.assertLess(elapsed, 10.0, f"poll_session_messages took too long: {elapsed:.1f}s")
 
 
 class StatusFooterEventCountTests(unittest.TestCase):

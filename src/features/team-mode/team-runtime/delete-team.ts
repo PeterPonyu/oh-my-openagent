@@ -10,8 +10,8 @@ import { withLock } from "../team-state-store/locks"
 import { listActiveTeams, transitionRuntimeState } from "../team-state-store/store"
 import type { RuntimeState } from "../types"
 import { DELETABLE_MEMBER_STATUSES, removeWorktrees } from "./shutdown-helpers"
-import { unregisterTeamRunForSessionCleanup } from "./session-team-run-registry"
 import { stopStuckSessionMonitor } from "./stuck-session-monitor"
+import { unregisterTeamRunForSessionCleanup } from "./session-team-run-registry"
 
 export type DeleteTeamDeps = {
   canVisualize: typeof canVisualize
@@ -95,6 +95,13 @@ export async function deleteTeam(
     // wake a member that's about to be killed.
     stopStuckSessionMonitor(teamRunId)
 
+    // Registry teardown MUST run even when a later step throws (e.g.
+    // removeWorktrees blowing up because base_dir is not a git repo).
+    // Without this, the in-memory team-session-registry keeps pointing at
+    // a runtime whose state.json has already been removed, which then
+    // blocks the next team_create with "session is already a participant".
+    try {
+
     if (bgMgr && runtimeState.leadSessionId) {
       const teamMessageMarkerPrefix = `team-create:${teamRunId}:`
       const teamTasks = bgMgr.getTasksByParentSession(runtimeState.leadSessionId)
@@ -145,9 +152,6 @@ export async function deleteTeam(
 
     await removeWorktrees([getRuntimeStateDir(baseDir, teamRunId)])
 
-    unregisterTeamSessionsByTeam(teamRunId)
-    unregisterTeamRunForSessionCleanup(teamRunId)
-
     const activeTeams = await listActiveTeams(config)
     sweepStaleTeamSessions(new Set(activeTeams.map((team) => team.teamRunId))).catch((sweepError: unknown) => {
       deps.log("team sweep stale sessions failed", {
@@ -159,5 +163,9 @@ export async function deleteTeam(
     })
 
     return { removedWorktrees, removedLayout }
+    } finally {
+      unregisterTeamSessionsByTeam(teamRunId)
+      unregisterTeamRunForSessionCleanup(teamRunId)
+    }
   }, { ownerTag: `delete-team:${teamRunId}` })
 }

@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+import { randomUUID } from "node:crypto"
 import { access, mkdtemp, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -26,7 +27,14 @@ const resolveMemberMock = mock(async (member: TeamSpec["members"][number]) => ({
   systemContent: `system:${member.name}`,
 }))
 
-mock.module("./resolve-member", () => ({ resolveMember: resolveMemberMock }))
+const resolveMemberWithPolicyMock = mock(async (input: { member: TeamSpec["members"][number]; seed?: { model: unknown } }) => ({
+  agentToUse: `${input.member.name}-agent`,
+  model: input.seed?.model ?? { providerID: "openai", modelID: "gpt-5.4-mini" },
+  fallbackChain: undefined,
+  systemContent: `system:${input.member.name}`,
+}))
+
+mock.module("./resolve-member", () => ({ resolveMember: resolveMemberMock, resolveMemberWithPolicy: resolveMemberWithPolicyMock }))
 
 const { createTeamRun, TeamRunCreateError } = await import("./create")
 
@@ -95,6 +103,7 @@ describe("createTeamRun", () => {
 
   beforeEach(() => {
     resolveMemberMock.mockClear()
+    resolveMemberWithPolicyMock.mockClear()
     clearTeamSessionRegistry()
     clearSessionTeamRunCleanupRegistry()
   })
@@ -125,6 +134,35 @@ describe("createTeamRun", () => {
     expect(runtimeState.status).toBe("active")
     expect(runtimeState.members.map((member) => member.sessionId)).toEqual(["session-1", "session-2", "session-3"])
     expect((launchMock.mock.calls as Array<[LaunchInput]>).every(([input]) => input.suppressTmuxSpawn === true)).toBe(true)
+  })
+
+  test("uses caller session model as stable seed when the team has no explicit lead member", async () => {
+    // given
+    const baseDir = await mkdtemp(path.join(tmpdir(), "team-runtime-caller-seed-"))
+    temporaryDirectories.push(baseDir)
+    let launchCount = 0
+    const { manager, launchMock } = createManager(baseDir, async (input) => ({
+      id: `task-${++launchCount}`,
+      sessionId: `session-${launchCount}`,
+      status: "running",
+      model: input.model,
+    } as BackgroundTask))
+    const context = createContext(baseDir, manager)
+    context.client.session.get = mock(async () => ({
+      data: { model: { providerID: "openai", id: "gpt-5.5" } },
+    }))
+    const spec = { ...createSpec(2), leadAgentId: undefined }
+
+    // when
+    await createTeamRun(spec, "lead-session", context, createConfig(baseDir), manager)
+
+    // then
+    expect(resolveMemberWithPolicyMock.mock.calls.every((call) => call[0].seed?.model.providerID === "openai")).toBe(true)
+    expect(resolveMemberWithPolicyMock.mock.calls.every((call) => call[0].seed?.model.modelID === "gpt-5.5")).toBe(true)
+    expect((launchMock.mock.calls as Array<[LaunchInput]>).map(([input]) => input.model)).toEqual([
+      { providerID: "openai", modelID: "gpt-5.5" },
+      { providerID: "openai", modelID: "gpt-5.5" },
+    ])
   })
 
   test("#given a new team runtime #when createTeamRun succeeds #then it registers the run for session cleanup", async () => {
@@ -299,6 +337,43 @@ describe("createTeamRun", () => {
     expect(launchMock).toHaveBeenCalledTimes(2)
   })
 
+  test("reuses a shutdown_requested runtime for the same spec and lead session", async () => {
+    // given
+    const baseDir = await mkdtemp(path.join(tmpdir(), "team-runtime-shutdown-requested-"))
+    temporaryDirectories.push(baseDir)
+    let launchCount = 0
+    const { manager, launchMock } = createManager(baseDir, async () => ({ id: `task-${++launchCount}`, sessionId: `session-${launchCount}`, status: "running" } as BackgroundTask))
+    const spec = createSpec(2)
+    const context = createContext(baseDir, manager)
+    const firstRuntime = await createTeamRun(spec, "lead-session", context, createConfig(baseDir), manager)
+    await (await import("../team-state-store/store")).saveRuntimeState({ ...firstRuntime, status: "shutdown_requested" }, createConfig(baseDir))
+
+    // when
+    const secondRuntime = await createTeamRun(spec, "lead-session", context, createConfig(baseDir), manager)
+
+    // then
+    expect(secondRuntime.teamRunId).toBe(firstRuntime.teamRunId)
+    expect(launchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test("rejects member worktree paths outside the repo or configured worktree base", async () => {
+    // given
+    const baseDir = await mkdtemp(path.join(tmpdir(), "team-runtime-worktree-sandbox-"))
+    temporaryDirectories.push(baseDir)
+    const { manager } = createManager(baseDir, async () => ({ id: "task-1", sessionId: "session-1", status: "running" } as BackgroundTask))
+    const spec = createSpec(1, true)
+    spec.members[0] = {
+      ...spec.members[0],
+      worktreePath: path.join(tmpdir(), `outside-team-worktree-${randomUUID()}`),
+    }
+
+    // when
+    const result = createTeamRun(spec, "lead-session", createContext(baseDir, manager), createConfig(baseDir), manager)
+
+    // then
+    await expect(result).rejects.toThrow("worktreePath must stay inside the repository root or configured worktree base directory")
+  })
+
   test("never exceeds max_parallel_members while spawning", async () => {
     // given
     const baseDir = await mkdtemp(path.join(tmpdir(), "team-runtime-parallel-"))
@@ -357,8 +432,12 @@ describe("createTeamRun", () => {
     // then
     expect(launchMock).toHaveBeenCalledTimes(1)
     expect(launchMock.mock.calls[0]?.[0]).toMatchObject({ description: "Create team member alpha-team/member-1" })
+    // The lead is pre-resolved out-of-pool to compute the stable-mode seed;
+    // the follower then resolves through the policy wrapper.
     expect(resolveMemberMock).toHaveBeenCalledTimes(1)
-    expect(resolveMemberMock.mock.calls[0]?.[0]).toMatchObject({ name: "member-1" })
+    expect(resolveMemberMock.mock.calls.map((call) => (call[0] as { name: string }).name)).toEqual(["lead"])
+    expect(resolveMemberWithPolicyMock).toHaveBeenCalledTimes(1)
+    expect(resolveMemberWithPolicyMock.mock.calls[0]?.[0].member.name).toBe("member-1")
     expect(runtimeState.members.map((member) => ({ name: member.name, sessionId: member.sessionId }))).toEqual([
       { name: "lead", sessionId: "lead-session" },
       { name: "member-1", sessionId: "member-1-agent-session-1" },

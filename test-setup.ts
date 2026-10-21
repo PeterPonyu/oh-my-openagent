@@ -1,3 +1,4 @@
+/// <reference types="bun-types" />
 import { afterEach, beforeEach, mock } from "bun:test"
 import { rmSync } from "node:fs"
 import { _resetForTesting as resetClaudeSessionState } from "./src/features/claude-code-session-state/state"
@@ -8,6 +9,7 @@ import { getOmoOpenCodeCacheDir } from "./src/shared/data-path"
 import { installModuleMockLifecycle } from "./src/testing/module-mock-lifecycle"
 
 const { restoreModuleMocks } = installModuleMockLifecycle(mock)
+const nativeEnvironment = process.env
 let environmentSnapshot: NodeJS.ProcessEnv = { ...process.env }
 let workingDirectorySnapshot = process.cwd()
 
@@ -16,6 +18,7 @@ function cleanupOmoCacheDir(cacheDir: string): void {
 }
 
 beforeEach(() => {
+  process.env = nativeEnvironment
   environmentSnapshot = { ...process.env }
   workingDirectorySnapshot = process.cwd()
   process.env.OMO_DISABLE_POSTHOG = "true"
@@ -28,6 +31,7 @@ beforeEach(() => {
 
 afterEach(() => {
   const currentCacheDir = getOmoOpenCodeCacheDir()
+  process.env = nativeEnvironment
 
   for (const key of Object.keys(process.env)) {
     if (!(key in environmentSnapshot)) {

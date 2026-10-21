@@ -18,7 +18,9 @@ import {
 import { loadPluginConfig } from "./plugin-config"
 import { createModelCacheState } from "./plugin-state"
 import { createFirstMessageVariantGate } from "./shared/first-message-variant"
-import { injectServerAuthIntoClient, log, logLegacyPluginStartupWarning } from "./shared"
+import { log } from "./shared/logger"
+import { logLegacyPluginStartupWarning } from "./shared/log-legacy-plugin-startup-warning"
+import { injectServerAuthIntoClient } from "./shared/opencode-server-auth"
 import { installAgentSortShim, setAgentSortOrder } from "./shared/agent-sort-shim"
 import { detectExternalSkillPlugin, getSkillPluginConflictWarning } from "./shared/external-plugin-detector"
 import { startBackgroundCheck as startTmuxCheck } from "./tools/interactive-bash"
@@ -105,6 +107,31 @@ const serverPlugin: Plugin = async (input, _options): Promise<Hooks> => {
     modelCacheState,
     backgroundNotificationHookEnabled: isHookEnabled("background-notification"),
   })
+
+  // Auto-recover team live-tail panes whose stored serverUrl no longer matches
+  // the current opencode server URL (e.g. after a port/URL change on restart).
+  if (pluginConfig.team_mode?.enabled) {
+    try {
+      const { recoverStaleTeamPanes } = await import("./features/team-mode/team-pane-url-recovery")
+      void recoverStaleTeamPanes(pluginConfig.team_mode, managers.tmuxSessionManager).catch((error) => {
+        log("[team-mode] recoverStaleTeamPanes crashed", { error: String(error) })
+      })
+    } catch (importError) {
+      log("[team-mode] team-pane-url-recovery module load failed", { error: String(importError) })
+    }
+  }
+
+  // Record PID + serverUrl so external tools (e.g. free-opencode-port.sh) can
+  // identify and coordinate with this opencode instance. Clear on exit
+  // (covers process.exit, SIGINT, SIGTERM, SIGHUP — not just beforeExit,
+  // which does not fire for short-lived opencode subcommands).
+  try {
+    const pidFileModule = await import("./shared/opencode-pid-file")
+    pidFileModule.writeOpencodePidFile(managers.tmuxSessionManager.getServerUrl())
+    pidFileModule.registerOpencodePidFileCleanup()
+  } catch (error) {
+    log("[oh-my-openagent] opencode-pid-file setup failed", { error: String(error) })
+  }
 
   const toolsResult = await createTools({
     ctx: input,

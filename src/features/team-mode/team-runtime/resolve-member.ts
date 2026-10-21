@@ -249,7 +249,9 @@ export function injectMemberModelOverride(
 }
 
 function delegatedModelConfigToString(model: DelegatedModelConfig): string {
-	return `${model.providerID}/${model.modelID}`;
+	return model.variant
+		? `${model.providerID}/${model.modelID} ${model.variant}`
+		: `${model.providerID}/${model.modelID}`;
 }
 
 /**
@@ -368,6 +370,7 @@ export async function resolveMemberWithPolicy(input: {
 		const reachable = filterReachableChainEntries(
 			chain,
 			policy.connectedProviders,
+			policy.disabledProviders,
 		);
 		if (reachable.length === 0) {
 			throw new TeamMemberResolutionError(
@@ -387,6 +390,7 @@ export async function resolveMemberWithPolicy(input: {
 		const provider = pickEntryProvider({
 			entry,
 			connectedProviders: policy.connectedProviders,
+			disabledProviders: policy.disabledProviders,
 		});
 		if (!provider) {
 			throw new TeamMemberResolutionError(

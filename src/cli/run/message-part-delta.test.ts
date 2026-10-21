@@ -90,6 +90,9 @@ describe("message.part.delta handling", () => {
     const ctx = createMockContext("ses_main")
     const state = createEventState()
     state.agentColorsByName["Sisyphus - Ultraworker"] = "#00CED1"
+    const colorKeys = ["NO_COLOR", "GITHUB_ACTIONS", "CI", "TERM"]
+    const originalColorEnv = colorKeys.map((key) => [key, process.env[key]] as const)
+    for (const key of colorKeys) delete process.env[key]
     const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
     const payload: EventPayload = {
       type: "message.updated",
@@ -108,15 +111,51 @@ describe("message.part.delta handling", () => {
     const { handleMessageUpdated } = require("./event-handlers") as {
       handleMessageUpdated: (ctx: RunContext, payload: EventPayload, state: ReturnType<typeof createEventState>) => void
     }
-    handleMessageUpdated(ctx, payload, state)
+    try {
+      handleMessageUpdated(ctx, payload, state)
 
-    //#then
-    const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
-    expect(rendered).toContain("\u001b[38;2;0;206;209m")
-    expect(rendered).toContain("claude-opus-4-7 (max)")
-    expect(rendered).toContain("└─")
-    expect(rendered).toContain("Sisyphus - Ultraworker")
-    stdoutSpy.mockRestore()
+      //#then
+      const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
+      expect(rendered).toContain("\u001b[38;2;0;206;209m")
+      expect(rendered).toContain("claude-opus-4-7 (max)")
+      expect(stripAnsi(rendered)).toMatch(/(?:└─|`-) Sisyphus - Ultraworker/)
+      expect(rendered).toContain("Sisyphus - Ultraworker")
+    } finally {
+      stdoutSpy.mockRestore()
+      for (const [key, value] of originalColorEnv) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
+  it("omits profile ANSI color when CI disables terminal color", () => {
+    //#given
+    const ctx = createMockContext("ses_main")
+    const state = createEventState()
+    state.agentColorsByName["Sisyphus - Ultraworker"] = "#00CED1"
+    const originalCI = process.env.CI
+    process.env.CI = "true"
+    const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(() => true)
+
+    try {
+      //#when
+      const { handleMessageUpdated } = require("./event-handlers") as {
+        handleMessageUpdated: (ctx: RunContext, payload: EventPayload, state: ReturnType<typeof createEventState>) => void
+      }
+      handleMessageUpdated(ctx, { type: "message.updated", properties: { info: {
+        sessionID: "ses_main", role: "assistant", agent: "Sisyphus - Ultraworker",
+      } } }, state)
+
+      //#then
+      const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
+      expect(rendered).toContain("Sisyphus - Ultraworker")
+      expect(rendered).not.toContain("\u001b[38;2;")
+    } finally {
+      stdoutSpy.mockRestore()
+      if (originalCI === undefined) delete process.env.CI
+      else process.env.CI = originalCI
+    }
   })
 
   it("separates think block output from normal response output", async () => {

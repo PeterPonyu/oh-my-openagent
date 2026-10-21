@@ -5,7 +5,7 @@ OpenCode TUI's `attach --session <child>` enters a static subagent-detail
 view (the `session.child.promptDisabled` mode) for any session with a
 parentID. That view shows only the kickoff prompt and never streams.
 
-This tailer subscribes to /event SSE and renders updates as plain text in
+This tailer combines /event SSE with message polling and renders updates in
 the companion live-tail tmux window while the main team window keeps attach.
 
 Usage: team-pane-live-tail.py <server-url> <session-id> [--no-clear] [--history N] [--insecure]
@@ -13,9 +13,12 @@ Usage: team-pane-live-tail.py <server-url> <session-id> [--no-clear] [--history 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import queue
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -80,8 +83,20 @@ class SessionState:
         self.agent = ""
         self.model = ""
         self.role_by_message: dict[str, str] = {}
+        self.parts_by_id: dict[str, dict] = {}
+        self.seen_parts: dict[str, int] = {}
+        self.seen_status: dict[str, str] = {}
+        self.seen_finish: set[str] = set()
         self.ssl_context = ssl._create_unverified_context() if insecure else ssl.create_default_context()
         self.footer: StatusFooter | None = None
+
+    def auth_headers(self) -> dict[str, str]:
+        password = os.environ.get("OPENCODE_SERVER_PASSWORD")
+        if not password:
+            return {}
+        username = os.environ.get("OPENCODE_SERVER_USERNAME") or "opencode"
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        return {"Authorization": f"Basic {token}"}
 
     def open_url(
         self,
@@ -89,7 +104,8 @@ class SessionState:
         timeout: float | None = 5,
         headers: dict[str, str] | None = None,
     ):
-        request = urllib.request.Request(url, headers=headers) if headers is not None else url
+        merged_headers = {**self.auth_headers(), **(headers or {})}
+        request = urllib.request.Request(url, headers=merged_headers) if merged_headers else url
         return urllib.request.urlopen(request, timeout=timeout, context=self.ssl_context)
 
     def fetch(self) -> None:
@@ -264,6 +280,17 @@ def fetch_history(state: SessionState, n: int) -> int:
         info = m.get("info", {})
         if info.get("id") and info.get("role"):
             state.role_by_message[info["id"]] = info["role"].upper()
+        if info.get("id") and info.get("finish"):
+            state.seen_finish.add(info["id"])
+        for part in m.get("parts", []):
+            part_id = part.get("id")
+            if not part_id:
+                continue
+            state.parts_by_id[part_id] = dict(part)
+            if part.get("type") in ("text", "reasoning"):
+                state.seen_parts[part_id] = len(part.get("text") or "")
+            elif part.get("type") == "tool":
+                state.seen_status[part_id] = (part.get("state") or {}).get("status", "?")
     # Find the kickoff prompt's task body (skip metadata headers).
     for m in msgs:
         info = m.get("info", {})
@@ -287,59 +314,93 @@ def fetch_history(state: SessionState, n: int) -> int:
     return len(msgs)
 
 
-class _StreamOpts:
-    """Options for stream_events()."""
+class _PollOpts:
+    """Options for poll_session_messages()."""
 
     def __init__(
         self,
-        idle_heartbeat_seconds: int = 30,
+        poll_interval_seconds: float = 1.0,
         max_reconnect_wallclock_seconds: int = 90,
     ) -> None:
-        self.idle_heartbeat_seconds = idle_heartbeat_seconds
+        self.poll_interval_seconds = poll_interval_seconds
         self.max_reconnect_wallclock_seconds = max_reconnect_wallclock_seconds
 
 
 _BACKOFF_SEQUENCE = (2, 5, 10, 15, 30)
 
 
-def stream_events(state: SessionState, opts: _StreamOpts | None = None) -> int:
+def read_session_events(state: SessionState, events: queue.Queue, stop: threading.Event) -> None:
+    """Queue live events; snapshots remain available when a host's SSE stalls."""
+    while not stop.is_set():
+        try:
+            with state.open_url(f"{state.url}/event", timeout=15, headers={"Accept": "text/event-stream"}) as response:
+                for raw in response:
+                    if stop.is_set():
+                        return
+                    if not raw.startswith(b"data:"):
+                        continue
+                    try:
+                        event = json.loads(raw[5:])
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    event = event.get("payload", event)
+                    if not isinstance(event, dict) or not match_session(event, state.session_id):
+                        continue
+                    while not stop.is_set():
+                        try:
+                            events.put(event, timeout=.5)
+                            break
+                        except queue.Full:
+                            continue
+        except (OSError, urllib.error.URLError):
+            stop.wait(1)
+            continue
+        stop.wait(1)
+
+
+def poll_session_messages(
+    state: SessionState,
+    opts: _PollOpts | None = None,
+    events: queue.Queue | None = None,
+) -> int:
+    """Render live events and poll snapshots for hosts that stop sending SSE."""
     if opts is None:
-        opts = _StreamOpts()
-    print(f"{DIM}── live tail (Ctrl-C to exit) ──{RST}")
-    seen_parts: dict[str, int] = {}
+        opts = _PollOpts()
+    interval = max(0.25, opts.poll_interval_seconds)
+    print(f"{DIM}── live tail (polling every {interval:.1f}s, Ctrl-C to exit) ──{RST}")
     failure_wallclock: float = 0.0
     attempt: int = 0
 
     while True:
+        if events is not None:
+            while True:
+                try:
+                    event = events.get_nowait()
+                except queue.Empty:
+                    break
+                if handle_event(event, state, state.seen_parts) and state.footer is not None:
+                    state.footer.note_event()
         try:
             with state.open_url(
-                f"{state.url}/event",
-                timeout=opts.idle_heartbeat_seconds,
-                headers={"Accept": "text/event-stream"},
+                f"{state.url}/session/{state.session_id}/message",
+                timeout=10,
             ) as r:
-                # Reset failure tracking on successful connection.
-                failure_wallclock = 0.0
-                attempt = 0
-                if state.footer is not None:
-                    state.footer.note_reconnect(state.url)
-                for raw in r:
-                    line = raw.decode("utf-8", errors="replace").rstrip()
-                    if not line.startswith("data: "):
-                        continue
-                    try:
-                        ev = json.loads(line[6:])
-                    except json.JSONDecodeError:
-                        continue
-                    if not match_session(ev, state.session_id):
-                        continue
-                    handle_event(ev, state, seen_parts)
-                    if state.footer is not None:
-                        state.footer.note_event()
-        except TimeoutError:
-            # Idle heartbeat: no data for idle_heartbeat_seconds → reopen quietly.
+                msgs = json.load(r)
+            # Reset failure tracking on a successful poll.
+            failure_wallclock = 0.0
+            attempt = 0
             if state.footer is not None:
-                state.footer.note_disconnect("idle timeout — reopening")
-            continue
+                state.footer.note_reconnect(state.url)
+            rendered_any = _render_polled_messages(msgs, state, state.seen_parts, state.seen_status, state.seen_finish)
+            if rendered_any and state.footer is not None:
+                state.footer.note_event()
+            time.sleep(interval)
+        except (TimeoutError, socket.timeout):
+            if state.footer is not None:
+                state.footer.note_disconnect("poll timeout — retrying")
+            time.sleep(interval)
         except (urllib.error.URLError, ConnectionResetError, OSError, ssl.SSLError) as e:
             if state.footer is not None:
                 state.footer.note_disconnect(str(e))
@@ -352,66 +413,119 @@ def stream_events(state: SessionState, opts: _StreamOpts | None = None) -> int:
                     f"Run team_refresh_panes to re-attach.]"
                 )
                 return 1
-            print(f"{DIM}stream interrupted ({e}); reconnecting in {delay}s{RST}")
+            print(f"{DIM}poll interrupted ({e}); retrying in {delay}s{RST}")
             attempt += 1
             time.sleep(delay)
+
+
+def _render_polled_messages(
+    msgs: list,
+    state: SessionState,
+    seen_parts: dict[str, int],
+    seen_status: dict[str, str],
+    seen_finish: set[str],
+) -> bool:
+    """Render newly-grown content from a /session/<id>/message snapshot.
+
+    Returns True iff at least one line was printed this tick.
+    """
+    rendered = False
+    for m in msgs:
+        info = m.get("info") or {}
+        msg_id = info.get("id") or ""
+        role = (info.get("role") or "ASSISTANT").upper()
+        if msg_id:
+            state.role_by_message[msg_id] = role
+        ts = fmt_ts(int(time.time() * 1000))
+        finish = info.get("finish")
+        if msg_id and finish and msg_id not in seen_finish:
+            seen_finish.add(msg_id)
+            print(f"{ts} {DIM}{role} finish={finish}{RST}")
+            rendered = True
+        for part in (m.get("parts") or []):
+            pid = part.get("id") or ""
+            ptype = part.get("type")
+            parent_msg = part.get("messageID") or msg_id
+            prole = state.role_by_message.get(parent_msg, role)
+            text = part.get("text") or ""
+            prev_len = seen_parts.get(pid, 0)
+            if ptype == "text" and text and len(text) > prev_len:
+                seen_parts[pid] = len(text)
+                # On first sighting of a peer-coordination text, fold the
+                # boilerplate down to a one-line summary (matches the SSE
+                # path's behaviour at handle_event:419-421).
+                if prev_len == 0:
+                    peer = summarize_peer_message(text)
+                    if peer:
+                        print(f"{ts} {BLU}PEER     {RST} {peer}")
+                        rendered = True
+                        continue
+                colour = CYAN if prole == "ASSISTANT" else GRN
+                new_chunk = text[prev_len:]
+                print(f"{ts} {colour}{prole:9s}{RST} {short(new_chunk)}")
+                rendered = True
+            elif ptype == "tool":
+                status = (part.get("state") or {}).get("status", "?")
+                if seen_status.get(pid) in ("completed", "error") and status not in ("completed", "error"):
+                    continue
+                if status != seen_status.get(pid):
+                    seen_status[pid] = status
+                    colour = YEL if status != "error" else RED
+                    tool = part.get("tool", "?")
+                    print(f"{ts} {colour}TOOL     {RST} {tool} → {status}")
+                    rendered = True
+            elif ptype == "reasoning" and text and len(text) > prev_len:
+                seen_parts[pid] = len(text)
+                new_chunk = text[prev_len:]
+                print(f"{ts} {MAG}REASONING{RST} {short(new_chunk, 80)}")
+                rendered = True
+    return rendered
 
 
 def match_session(ev: dict, session_id: str) -> bool:
     props = ev.get("properties", {}) or {}
     candidates = (
         props.get("sessionID"),
+        props.get("sessionId"),
         (props.get("info") or {}).get("sessionID"),
+        (props.get("info") or {}).get("sessionId"),
         (props.get("part") or {}).get("sessionID"),
-        (props.get("info") or {}).get("id"),
+        (props.get("part") or {}).get("sessionId"),
     )
     return any(c == session_id for c in candidates if c)
 
 
-def handle_event(ev: dict, state: SessionState, seen: dict[str, int]) -> None:
+def handle_event(ev: dict, state: SessionState, seen: dict[str, int]) -> bool:
     etype = ev.get("type", "")
     props = ev.get("properties", {}) or {}
-    ts = fmt_ts(int(time.time() * 1000))
     if etype == "message.updated":
         info = props.get("info", {}) or {}
-        msg_id = info.get("id")
-        role = info.get("role", "?").upper()
-        if msg_id:
-            state.role_by_message[msg_id] = role
-        finish = info.get("finish")
-        if finish:
-            print(f"{ts} {DIM}{role} finish={finish}{RST}")
-        return
-    if etype != "message.part.updated":
-        return
-    part = props.get("part", {}) or {}
-    pid = part.get("id") or ""
+        return _render_polled_messages(
+            [{"info": info, "parts": []}], state, seen, state.seen_status, state.seen_finish,
+        )
+    if etype == "message.part.updated":
+        update = props.get("part", {}) or {}
+        cached = state.parts_by_id.get(update.get("id"), {})
+        part = {**cached, **update}
+        if len(cached.get("text") or "") > len(part.get("text") or ""):
+            part["text"] = cached["text"]
+    elif etype == "message.part.delta":
+        message_id = props.get("messageID") or props.get("messageId")
+        part_id = props.get("partID") or props.get("partId")
+        if not part_id or props.get("field") != "text" or not props.get("delta"):
+            return False
+        part = {"id": part_id, "type": "text", "messageID": message_id, **state.parts_by_id.get(part_id, {})}
+        part["text"] = (part.get("text") or "") + props["delta"]
+    else:
+        return False
+    if part.get("id"):
+        state.parts_by_id[part["id"]] = dict(part)
     parent_msg = part.get("messageID") or ""
     role = state.role_by_message.get(parent_msg, "ASSISTANT")
-    ptype = part.get("type")
-    text = part.get("text") or ""
-    # Dedup growing-text streams: print only when the visible prefix grew.
-    prev_len = seen.get(pid, 0)
-    if ptype == "text" and text and len(text) > prev_len:
-        seen[pid] = len(text)
-        peer = summarize_peer_message(text)
-        if peer:
-            print(f"{ts} {BLU}PEER     {RST} {peer}")
-        else:
-            colour = CYAN if role == "ASSISTANT" else GRN
-            print(f"{ts} {colour}{role:9s}{RST} {short(text)}")
-    elif ptype == "tool":
-        # Tool events fire on every status transition; only print on terminal states.
-        status = (part.get("state") or {}).get("status", "?")
-        prev_status = seen.get(f"{pid}:status")
-        if status != prev_status:
-            seen[f"{pid}:status"] = status  # type: ignore[assignment]
-            colour = YEL if status != "error" else RED
-            tool = part.get("tool", "?")
-            print(f"{ts} {colour}TOOL     {RST} {tool} → {status}")
-    elif ptype == "reasoning" and text and len(text) > prev_len:
-        seen[pid] = len(text)
-        print(f"{ts} {MAG}REASONING{RST} {short(text, 80)}")
+    return _render_polled_messages(
+        [{"info": {"id": parent_msg, "role": role}, "parts": [part]}],
+        state, seen, state.seen_status, state.seen_finish,
+    )
 
 
 def main() -> int:
@@ -421,7 +535,11 @@ def main() -> int:
     p.add_argument("--no-clear", action="store_true")
     p.add_argument("--history", type=int, default=4)
     p.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification (local/dev only).")
-    p.add_argument("--idle-heartbeat-seconds", type=int, default=30, metavar="N")
+    p.add_argument("--poll-interval-seconds", type=float, default=1.0, metavar="N",
+                   help="How often to poll /session/<id>/message (default 1.0s).")
+    # Keep accepting the flag emitted by older team_refresh_panes versions.
+    p.add_argument("--idle-heartbeat-seconds", type=int, default=30, metavar="N",
+                   help="Deprecated, ignored (live events and polling run together).")
     p.add_argument("--max-reconnect-wallclock-seconds", type=int, default=90, metavar="N")
     p.add_argument("--no-footer", action="store_true")
     args = p.parse_args()
@@ -439,14 +557,21 @@ def main() -> int:
         state.footer.start()
 
     fetch_history(state, args.history)
-    opts = _StreamOpts(
-        idle_heartbeat_seconds=args.idle_heartbeat_seconds,
+    opts = _PollOpts(
+        poll_interval_seconds=args.poll_interval_seconds,
         max_reconnect_wallclock_seconds=args.max_reconnect_wallclock_seconds,
     )
-    result = stream_events(state, opts)
-
-    if state.footer is not None:
-        state.footer.stop()
+    events = queue.Queue(maxsize=1024)
+    stop = threading.Event()
+    reader = threading.Thread(target=read_session_events, args=(state, events, stop), daemon=True)
+    reader.start()
+    try:
+        result = poll_session_messages(state, opts, events)
+    finally:
+        stop.set()
+        reader.join(timeout=1)
+        if state.footer is not None:
+            state.footer.stop()
 
     return result
 
