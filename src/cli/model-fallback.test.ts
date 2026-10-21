@@ -22,6 +22,35 @@ function createConfig(overrides: Partial<InstallConfig> = {}): InstallConfig {
 }
 
 describe("generateModelConfig", () => {
+  describe("Sisyphus-Junior provider routing", () => {
+    test("prefers the declared OpenAI entry when OpenAI and Claude are available", () => {
+      // #given both providers in the Junior chain are available
+      const config = createConfig({ hasOpenAI: true, hasClaude: true })
+
+      // #when the installer generates the agent config
+      const result = generateModelConfig(config)
+
+      // #then the topic branch's OpenAI route keeps its variant and Claude fallback
+      expect(result.agents?.["sisyphus-junior"]).toMatchObject({
+        model: "openai/gpt-5.5",
+        variant: "medium",
+        fallback_models: [{ model: "anthropic/claude-sonnet-4-6" }],
+      })
+    })
+
+    test("uses the available Claude entry when OpenAI is unavailable", () => {
+      // #given only Claude is configured
+      const config = createConfig({ hasClaude: true })
+
+      // #when the installer generates the agent config
+      const result = generateModelConfig(config)
+
+      // #then it does not select an unavailable OpenAI provider
+      expect(result.agents?.["sisyphus-junior"]?.model).toBe("anthropic/claude-sonnet-4-6")
+      expect(result.agents?.["sisyphus-junior"]?.fallback_models).toBeUndefined()
+    })
+  })
+
   describe("no providers available", () => {
     test("returns ULTIMATE_FALLBACK for all agents and categories when no providers", () => {
       // #given no providers are available

@@ -6,6 +6,20 @@ import type { OmoConfig } from "./model-resolution-types"
 const PROJECT_CONFIG_DIR = join(process.cwd(), ".opencode")
 
 export function loadOmoConfig(): OmoConfig | null {
+  if (process.env.OPENCODE_CONFIG_DIR?.trim()) {
+    const userConfigDir = getOpenCodeConfigDir({ binary: "opencode" })
+    const userDetected = detectPluginConfigFile(userConfigDir)
+    if (userDetected.format !== "none") {
+      try {
+        const content = readFileSync(userDetected.path, "utf-8")
+        return parseJsonc<OmoConfig>(content)
+      } catch {
+        return null
+      }
+    }
+    return null
+  }
+
   const projectDetected = detectPluginConfigFile(PROJECT_CONFIG_DIR)
   if (projectDetected.format !== "none") {
     try {

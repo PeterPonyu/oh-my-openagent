@@ -1,6 +1,21 @@
 import type { ModelCapabilitiesSnapshotEntry } from "./types"
 
 export const SUPPLEMENTAL_MODEL_CAPABILITIES: Record<string, ModelCapabilitiesSnapshotEntry> = {
+	// https://api-docs.deepseek.com/quick_start/pricing/ and /api/create-chat-completion/
+	"deepseek-v4-pro": {
+		id: "deepseek-v4-pro",
+		family: "deepseek",
+		reasoning: true,
+		temperature: true,
+		toolCall: true,
+		modalities: {
+			input: ["text"],
+			output: ["text"],
+		},
+		limit: {
+			output: 393216,
+		},
+	},
 	"kimi-k2.6": {
 		id: "kimi-k2.6",
 		family: "kimi",

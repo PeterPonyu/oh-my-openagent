@@ -20,6 +20,13 @@ interface ConfigValidationResult {
 }
 
 function findConfigPath(): string | null {
+  if (process.env.OPENCODE_CONFIG_DIR?.trim()) {
+    const userConfigDir = getOpenCodeConfigDir({ binary: "opencode" })
+    const userConfig = detectPluginConfigFile(userConfigDir)
+    if (userConfig.format !== "none") return userConfig.path
+    return null
+  }
+
   const projectConfig = detectPluginConfigFile(PROJECT_CONFIG_DIR)
   if (projectConfig.format !== "none") return projectConfig.path
 
