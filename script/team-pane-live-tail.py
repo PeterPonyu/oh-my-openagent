@@ -5,7 +5,7 @@ OpenCode TUI's `attach --session <child>` enters a static subagent-detail
 view (the `session.child.promptDisabled` mode) for any session with a
 parentID. That view shows only the kickoff prompt and never streams.
 
-This tailer subscribes to /event SSE and renders updates as plain text in
+This tailer combines /event SSE with message polling and renders updates in
 the companion live-tail tmux window while the main team window keeps attach.
 
 Usage: team-pane-live-tail.py <server-url> <session-id> [--no-clear] [--history N] [--insecure]
@@ -16,6 +16,7 @@ import argparse
 import base64
 import json
 import os
+import queue
 import re
 import socket
 import ssl
@@ -82,6 +83,10 @@ class SessionState:
         self.agent = ""
         self.model = ""
         self.role_by_message: dict[str, str] = {}
+        self.parts_by_id: dict[str, dict] = {}
+        self.seen_parts: dict[str, int] = {}
+        self.seen_status: dict[str, str] = {}
+        self.seen_finish: set[str] = set()
         self.ssl_context = ssl._create_unverified_context() if insecure else ssl.create_default_context()
         self.footer: StatusFooter | None = None
 
@@ -275,6 +280,17 @@ def fetch_history(state: SessionState, n: int) -> int:
         info = m.get("info", {})
         if info.get("id") and info.get("role"):
             state.role_by_message[info["id"]] = info["role"].upper()
+        if info.get("id") and info.get("finish"):
+            state.seen_finish.add(info["id"])
+        for part in m.get("parts", []):
+            part_id = part.get("id")
+            if not part_id:
+                continue
+            state.parts_by_id[part_id] = dict(part)
+            if part.get("type") in ("text", "reasoning"):
+                state.seen_parts[part_id] = len(part.get("text") or "")
+            elif part.get("type") == "tool":
+                state.seen_status[part_id] = (part.get("state") or {}).get("status", "?")
     # Find the kickoff prompt's task body (skip metadata headers).
     for m in msgs:
         info = m.get("info", {})
@@ -313,27 +329,59 @@ class _PollOpts:
 _BACKOFF_SEQUENCE = (2, 5, 10, 15, 30)
 
 
-def poll_session_messages(state: SessionState, opts: _PollOpts | None = None) -> int:
-    """Tail the session by polling /session/<id>/message at a steady cadence.
+def read_session_events(state: SessionState, events: queue.Queue, stop: threading.Event) -> None:
+    """Queue live events; snapshots remain available when a host's SSE stalls."""
+    while not stop.is_set():
+        try:
+            with state.open_url(f"{state.url}/event", timeout=15, headers={"Accept": "text/event-stream"}) as response:
+                for raw in response:
+                    if stop.is_set():
+                        return
+                    if not raw.startswith(b"data:"):
+                        continue
+                    try:
+                        event = json.loads(raw[5:])
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    event = event.get("payload", event)
+                    if not isinstance(event, dict) or not match_session(event, state.session_id):
+                        continue
+                    while not stop.is_set():
+                        try:
+                            events.put(event, timeout=.5)
+                            break
+                        except queue.Full:
+                            continue
+        except (OSError, urllib.error.URLError):
+            stop.wait(1)
+            continue
+        stop.wait(1)
 
-    Replaces the prior `/event` SSE flow. opencode 1.14.48's SSE endpoint
-    accepts subscribers but stops delivering events shortly after the
-    initial `server.connected` handshake (verified via 20s curl: 0 data
-    frames received while the bus published >140 message.part.delta
-    events). The opencode TUI itself uses /session/<id>/message polling
-    for the same reason — we match that strategy here.
-    """
+
+def poll_session_messages(
+    state: SessionState,
+    opts: _PollOpts | None = None,
+    events: queue.Queue | None = None,
+) -> int:
+    """Render live events and poll snapshots for hosts that stop sending SSE."""
     if opts is None:
         opts = _PollOpts()
     interval = max(0.25, opts.poll_interval_seconds)
     print(f"{DIM}── live tail (polling every {interval:.1f}s, Ctrl-C to exit) ──{RST}")
-    seen_parts: dict[str, int] = {}
-    seen_status: dict[str, str] = {}
-    seen_finish: set[str] = set()
     failure_wallclock: float = 0.0
     attempt: int = 0
 
     while True:
+        if events is not None:
+            while True:
+                try:
+                    event = events.get_nowait()
+                except queue.Empty:
+                    break
+                if handle_event(event, state, state.seen_parts) and state.footer is not None:
+                    state.footer.note_event()
         try:
             with state.open_url(
                 f"{state.url}/session/{state.session_id}/message",
@@ -345,7 +393,7 @@ def poll_session_messages(state: SessionState, opts: _PollOpts | None = None) ->
             attempt = 0
             if state.footer is not None:
                 state.footer.note_reconnect(state.url)
-            rendered_any = _render_polled_messages(msgs, state, seen_parts, seen_status, seen_finish)
+            rendered_any = _render_polled_messages(msgs, state, state.seen_parts, state.seen_status, state.seen_finish)
             if rendered_any and state.footer is not None:
                 state.footer.note_event()
             time.sleep(interval)
@@ -418,6 +466,8 @@ def _render_polled_messages(
                 rendered = True
             elif ptype == "tool":
                 status = (part.get("state") or {}).get("status", "?")
+                if seen_status.get(pid) in ("completed", "error") and status not in ("completed", "error"):
+                    continue
                 if status != seen_status.get(pid):
                     seen_status[pid] = status
                     colour = YEL if status != "error" else RED
@@ -445,59 +495,37 @@ def match_session(ev: dict, session_id: str) -> bool:
     return any(c == session_id for c in candidates if c)
 
 
-def handle_event(ev: dict, state: SessionState, seen: dict[str, int]) -> None:
+def handle_event(ev: dict, state: SessionState, seen: dict[str, int]) -> bool:
     etype = ev.get("type", "")
     props = ev.get("properties", {}) or {}
-    ts = fmt_ts(int(time.time() * 1000))
     if etype == "message.updated":
         info = props.get("info", {}) or {}
-        msg_id = info.get("id")
-        role = info.get("role", "?").upper()
-        if msg_id:
-            state.role_by_message[msg_id] = role
-        finish = info.get("finish")
-        if finish:
-            print(f"{ts} {DIM}{role} finish={finish}{RST}")
-        return
-    if etype == "message.part.delta":
+        return _render_polled_messages(
+            [{"info": info, "parts": []}], state, seen, state.seen_status, state.seen_finish,
+        )
+    if etype == "message.part.updated":
+        update = props.get("part", {}) or {}
+        cached = state.parts_by_id.get(update.get("id"), {})
+        part = {**cached, **update}
+        if len(cached.get("text") or "") > len(part.get("text") or ""):
+            part["text"] = cached["text"]
+    elif etype == "message.part.delta":
         message_id = props.get("messageID") or props.get("messageId")
-        role = state.role_by_message.get(message_id, "ASSISTANT")
-        field = props.get("field")
-        delta = props.get("delta") or ""
-        if field == "text" and delta:
-            colour = CYAN if role == "ASSISTANT" else GRN
-            print(f"{ts} {colour}{role:9s}{RST} {short(delta)}")
-        return
-    if etype != "message.part.updated":
-        return
-    part = props.get("part", {}) or {}
-    pid = part.get("id") or ""
+        part_id = props.get("partID") or props.get("partId")
+        if not part_id or props.get("field") != "text" or not props.get("delta"):
+            return False
+        part = {"id": part_id, "type": "text", "messageID": message_id, **state.parts_by_id.get(part_id, {})}
+        part["text"] = (part.get("text") or "") + props["delta"]
+    else:
+        return False
+    if part.get("id"):
+        state.parts_by_id[part["id"]] = dict(part)
     parent_msg = part.get("messageID") or ""
     role = state.role_by_message.get(parent_msg, "ASSISTANT")
-    ptype = part.get("type")
-    text = part.get("text") or ""
-    # Dedup growing-text streams: print only when the visible prefix grew.
-    prev_len = seen.get(pid, 0)
-    if ptype == "text" and text and len(text) > prev_len:
-        seen[pid] = len(text)
-        peer = summarize_peer_message(text)
-        if peer:
-            print(f"{ts} {BLU}PEER     {RST} {peer}")
-        else:
-            colour = CYAN if role == "ASSISTANT" else GRN
-            print(f"{ts} {colour}{role:9s}{RST} {short(text)}")
-    elif ptype == "tool":
-        # Tool events fire on every status transition; only print on terminal states.
-        status = (part.get("state") or {}).get("status", "?")
-        prev_status = seen.get(f"{pid}:status")
-        if status != prev_status:
-            seen[f"{pid}:status"] = status  # type: ignore[assignment]
-            colour = YEL if status != "error" else RED
-            tool = part.get("tool", "?")
-            print(f"{ts} {colour}TOOL     {RST} {tool} → {status}")
-    elif ptype == "reasoning" and text and len(text) > prev_len:
-        seen[pid] = len(text)
-        print(f"{ts} {MAG}REASONING{RST} {short(text, 80)}")
+    return _render_polled_messages(
+        [{"info": {"id": parent_msg, "role": role}, "parts": [part]}],
+        state, seen, state.seen_status, state.seen_finish,
+    )
 
 
 def main() -> int:
@@ -509,10 +537,9 @@ def main() -> int:
     p.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification (local/dev only).")
     p.add_argument("--poll-interval-seconds", type=float, default=1.0, metavar="N",
                    help="How often to poll /session/<id>/message (default 1.0s).")
-    # Back-compat: kept so older team_refresh_panes invocations don't crash on
-    # the unknown flag. Value is ignored — SSE has been replaced by polling.
+    # Keep accepting the flag emitted by older team_refresh_panes versions.
     p.add_argument("--idle-heartbeat-seconds", type=int, default=30, metavar="N",
-                   help="Deprecated, ignored (SSE replaced by polling).")
+                   help="Deprecated, ignored (live events and polling run together).")
     p.add_argument("--max-reconnect-wallclock-seconds", type=int, default=90, metavar="N")
     p.add_argument("--no-footer", action="store_true")
     args = p.parse_args()
@@ -534,10 +561,17 @@ def main() -> int:
         poll_interval_seconds=args.poll_interval_seconds,
         max_reconnect_wallclock_seconds=args.max_reconnect_wallclock_seconds,
     )
-    result = poll_session_messages(state, opts)
-
-    if state.footer is not None:
-        state.footer.stop()
+    events = queue.Queue(maxsize=1024)
+    stop = threading.Event()
+    reader = threading.Thread(target=read_session_events, args=(state, events, stop), daemon=True)
+    reader.start()
+    try:
+        result = poll_session_messages(state, opts, events)
+    finally:
+        stop.set()
+        reader.join(timeout=1)
+        if state.footer is not None:
+            state.footer.stop()
 
     return result
 

@@ -163,6 +163,69 @@ class SessionStateFetchTests(unittest.TestCase):
 
 
 class HandleEventTests(unittest.TestCase):
+    def test_live_deltas_and_completed_snapshot_render_each_chunk_once(self) -> None:
+        state = mod.SessionState("http://x", "ses_y")
+        state.role_by_message["m1"] = "ASSISTANT"
+        seen = state.seen_parts
+        def delta(text):
+            return {"type": "message.part.delta", "properties": {
+                "messageID": "m1", "partID": "p1", "field": "text", "delta": text,
+            }}
+        snapshot = [{"info": {"id": "m1", "role": "assistant"}, "parts": [
+            {"id": "p1", "type": "text", "messageID": "m1", "text": "prefix suffix"},
+        ]}]
+        with patch("sys.stdout", new=StringIO()) as output:
+            mod.handle_event(delta("prefix"), state, seen)
+            mod.handle_event(delta(" suffix"), state, seen)
+            mod._render_polled_messages(snapshot, state, seen, state.seen_status, state.seen_finish)
+        self.assertEqual(output.getvalue().count("prefix"), 1)
+        self.assertEqual(output.getvalue().count("suffix"), 1)
+
+    def test_completed_snapshot_before_queued_delta_does_not_duplicate_suffix(self) -> None:
+        state = mod.SessionState("http://x", "ses_y")
+        seen = state.seen_parts
+        def delta(text):
+            return {"type": "message.part.delta", "properties": {
+                "messageID": "m1", "partID": "p1", "field": "text", "delta": text,
+            }}
+        with patch("sys.stdout", new=StringIO()) as output:
+            mod.handle_event(delta("prefix"), state, seen)
+            mod._render_polled_messages([
+                {"info": {"id": "m1", "role": "assistant"}, "parts": [
+                    {"id": "p1", "type": "text", "messageID": "m1", "text": "prefix suffix"},
+                ]},
+            ], state, seen, state.seen_status, state.seen_finish)
+            mod.handle_event(delta(" suffix"), state, seen)
+        self.assertEqual(output.getvalue().count("prefix"), 1)
+        self.assertEqual(output.getvalue().count("suffix"), 1)
+
+    def test_reasoning_delta_keeps_part_type(self) -> None:
+        state = mod.SessionState("http://x", "ses_y")
+        with patch("sys.stdout", new=StringIO()) as output:
+            mod.handle_event({"type": "message.part.updated", "properties": {"part": {
+                "id": "p1", "type": "reasoning", "messageID": "m1", "text": "",
+            }}}, state, state.seen_parts)
+            mod.handle_event({"type": "message.part.delta", "properties": {
+                "messageID": "m1", "partID": "p1", "field": "text", "delta": "considering",
+            }}, state, state.seen_parts)
+        self.assertIn("REASONING", output.getvalue())
+        self.assertIn("considering", output.getvalue())
+
+    def test_queued_running_event_does_not_regress_completed_snapshot(self) -> None:
+        state = mod.SessionState("http://x", "ses_y")
+        part = {"id": "p1", "type": "tool", "messageID": "m1", "tool": "grep",
+                "state": {"status": "completed"}}
+        with patch("sys.stdout", new=StringIO()) as output:
+            mod._render_polled_messages(
+                [{"info": {"id": "m1", "role": "assistant"}, "parts": [part]}],
+                state, state.seen_parts, state.seen_status, state.seen_finish,
+            )
+            mod.handle_event({"type": "message.part.updated", "properties": {"part": {
+                **part, "state": {"status": "running"},
+            }}}, state, state.seen_parts)
+        self.assertIn("grep → completed", output.getvalue())
+        self.assertNotIn("grep → running", output.getvalue())
+
     def test_user_role_text_renders_as_user(self) -> None:
         state = mod.SessionState("http://x", "ses_y")
         state.role_by_message["msg1"] = "USER"
@@ -268,8 +331,42 @@ class MatchSessionTests(unittest.TestCase):
         self.assertFalse(mod.match_session(ev, "ses_abc"))
 
 
+class SessionEventReaderTests(unittest.TestCase):
+    def test_retries_a_disconnected_stream_until_stopped(self) -> None:
+        import queue
+        import threading
+
+        state = mod.SessionState("http://x", "ses_y")
+        stop = threading.Event()
+        with patch.object(state, "open_url", side_effect=ConnectionResetError("disconnected")) as open_url:
+            with patch.object(stop, "wait", side_effect=lambda delay: stop.set()) as wait:
+                mod.read_session_events(state, queue.Queue(), stop)
+        open_url.assert_called_once()
+        wait.assert_called_once_with(1)
+
+    def test_queues_only_matching_session_and_ignores_invalid_frames(self) -> None:
+        import io
+        import queue
+        import threading
+
+        state = mod.SessionState("http://x/", "ses_y")
+        events = queue.Queue()
+        stop = threading.Event()
+        wanted = {"type": "message.part.delta", "properties": {"sessionID": "ses_y"}}
+        other = {"type": "message.part.delta", "properties": {"sessionID": "ses_other"}}
+        response = io.BytesIO(b"data: broken\n\ndata: []\n\n" +
+                              b"data: " + json.dumps(other).encode() + b"\n\n" +
+                              b"data: " + json.dumps({"payload": wanted}).encode() + b"\n\n")
+        with patch.object(state, "open_url", return_value=response) as open_url:
+            with patch.object(stop, "wait", side_effect=lambda delay: stop.set()):
+                mod.read_session_events(state, events, stop)
+        self.assertEqual(events.get_nowait(), wanted)
+        self.assertTrue(events.empty())
+        open_url.assert_called_once_with("http://x/event", timeout=15, headers={"Accept": "text/event-stream"})
+
+
 class PolledMessageRendererTests(unittest.TestCase):
-    """Validate the /session/<id>/message polling renderer that replaced SSE."""
+    """Validate the message snapshot fallback and shared renderer."""
 
     def _render(self, msgs: list) -> tuple[str, dict, dict, set]:
         state = mod.SessionState("http://x", "ses_poll")
