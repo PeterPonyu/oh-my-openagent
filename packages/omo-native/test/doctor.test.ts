@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { delimiter, dirname, join, resolve } from "node:path"
 import { spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
+
 import { DOCTOR_PLUGIN_ARTIFACTS } from "../bin/lib/doctor.js"
 
 const SOURCE_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)))
 const roots: string[] = []
-const artifacts = DOCTOR_PLUGIN_ARTIFACTS as ReadonlyArray<readonly [string, string]>
+const artifacts = DOCTOR_PLUGIN_ARTIFACTS
 
 type Fixture = { root: string; packageRoot: string; launcher: string; agentDir: string }
 
@@ -45,10 +46,36 @@ function createFixture(): Fixture {
   return { root, packageRoot, launcher: join(packageRoot, "bin", "omo.js"), agentDir }
 }
 
+function writeFakePs(dir: string, output: string): string {
+  writeFile(join(dir, "ps"), `#!/bin/sh\nprintf '%s' ${JSON.stringify(output)}\n`)
+  chmodSync(join(dir, "ps"), 0o755)
+  return dir
+}
+
+// Doctor lists engines with `ps`; an empty fake first on PATH keeps the host's processes out.
+function withoutHostProcesses(fixture: Fixture, env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const fakeBin = writeFakePs(join(fixture.root, "no-host-ps"), "")
+  return { ...env, PATH: `${fakeBin}${delimiter}${env.PATH ?? ""}` }
+}
+
+// An agent dir exported by the calling shell (an omo or senpi session) outranks the fixture's,
+// so the child sees only the agent-dir variables a test sets (#10265).
+function withoutInheritedAgentDir(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const isolated: NodeJS.ProcessEnv = { ...env }
+  delete isolated.OMO_CODING_AGENT_DIR
+  delete isolated.SENPI_CODING_AGENT_DIR
+  delete isolated.PI_CODING_AGENT_DIR
+  return isolated
+}
+
 function run(fixture: Fixture, env: NodeJS.ProcessEnv = {}) {
   return spawnSync(process.execPath, [fixture.launcher, "doctor"], {
     encoding: "utf8",
-    env: { ...process.env, SENPI_CODING_AGENT_DIR: fixture.agentDir, ...env },
+    env: withoutHostProcesses(fixture, {
+      ...withoutInheritedAgentDir(process.env),
+      SENPI_CODING_AGENT_DIR: fixture.agentDir,
+      ...env,
+    }),
   })
 }
 
@@ -57,10 +84,12 @@ afterEach(() => {
 })
 
 describe("omo doctor", () => {
-  describe("#given the plugin diagnostic checklist", () => {
-    test("#when inspected #then it requires the published x-search skill", () => {
-      expect(artifacts.map(([, path]) => path)).toContain("plugin/skills-conditional/x-search/SKILL.md")
-    })
+  test("#given a missing credential-gated x-search payload #when doctor runs #then diagnostics fail", () => {
+    const fixture = createFixture()
+    rmSync(join(fixture.packageRoot, "plugin/skills-conditional/x-search/SKILL.md"), { force: true })
+    const result = run(fixture)
+    expect(result.status).toBe(1)
+    expect(result.stdout).toContain("FAIL x-search skill: missing plugin/skills-conditional/x-search/SKILL.md")
   })
 
   describe("#given a complete packaged installation", () => {
@@ -68,7 +97,7 @@ describe("omo doctor", () => {
       test("#then every required check passes", () => {
         const fixture = createFixture()
         const result = run(fixture)
-        expect(result.status).toBe(0)
+        expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0)
         for (const [label] of artifacts) expect(result.stdout).toContain(`PASS ${label}`)
         expect(result.stdout).toContain("PASS senpi CLI")
         expect(result.stdout).toContain("PASS senpi version 2026.8.9")
@@ -152,14 +181,27 @@ describe("omo doctor", () => {
 })
 
 function envWithoutAgentDir(home: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home }
-  delete env.OMO_CODING_AGENT_DIR
-  delete env.SENPI_CODING_AGENT_DIR
-  delete env.PI_CODING_AGENT_DIR
-  return env
+  return { ...withoutInheritedAgentDir(process.env), HOME: home, USERPROFILE: home }
 }
 
 describe("omo doctor", () => {
+  describe("#given the host is running a stale engine", () => {
+    describe("#when diagnostics run", () => {
+      test("#then the fixture's output never reports a host pid", () => {
+        const fixture = createFixture()
+        const hostBin = writeFakePs(
+          join(fixture.root, "host-ps"),
+          "  4242     1  2-00:00:00 ttys001 node /opt/host/senpi/dist/cli.js\n",
+        )
+
+        const result = run(fixture, { PATH: `${hostBin}${delimiter}${process.env.PATH ?? ""}` })
+
+        expect(result.stdout).toContain("PASS senpi CLI")
+        expect(result.stdout).not.toContain("engine pid")
+      })
+    })
+  })
+
   describe("#given no agent directory is configured", () => {
     describe("#when diagnostics run", () => {
       test("#then the canonical branded directory is the one inspected", () => {
@@ -172,7 +214,7 @@ describe("omo doctor", () => {
 
         const result = spawnSync(process.execPath, [fixture.launcher, "doctor"], {
           encoding: "utf8",
-          env: envWithoutAgentDir(home),
+          env: withoutHostProcesses(fixture, envWithoutAgentDir(home)),
         })
 
         expect(result.stdout).toContain("WARN duplicate @code-yeongyu/omo-senpi package entry")

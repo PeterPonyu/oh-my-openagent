@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { DOCTOR_PLUGIN_ARTIFACTS } from "../bin/lib/doctor.js"
 import { createHash } from "node:crypto"
 import { spawnSync } from "node:child_process"
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
@@ -7,7 +8,6 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { detectHarnesses, needsSetupSuggestion } from "../bin/lib/setup-detect.js"
 import { formatSetupReport } from "../bin/lib/setup-report.js"
-import { DOCTOR_PLUGIN_ARTIFACTS } from "../bin/lib/doctor.js"
 
 function sqlLiteral(value: string | null): string {
   return value === null ? "NULL" : `'${value.replace(/'/g, "''")}'`

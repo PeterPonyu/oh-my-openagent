@@ -4,17 +4,13 @@ import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
-import {
-  DOCTOR_PLUGIN_ARTIFACTS,
-  fetchNpmDistTagsSync,
-  latestFromDistTags,
-  runDoctor,
-} from "../bin/lib/doctor.js"
+import { DOCTOR_PLUGIN_ARTIFACTS, latestFromDistTags, runDoctor } from "../bin/lib/doctor.js"
+import { fetchNpmDistTagsSync } from "../bin/lib/npm-dist-tags.js"
 import { packageManifest, updateTarget } from "../bin/lib/package-paths.js"
 
 const SOURCE_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)))
 const roots: string[] = []
-const artifacts = DOCTOR_PLUGIN_ARTIFACTS as ReadonlyArray<readonly [string, string]>
+const artifacts = DOCTOR_PLUGIN_ARTIFACTS
 
 type Fixture = { root: string; packageRoot: string; launcher: string; agentDir: string }
 type InstallLayout = "bun" | "npm"
