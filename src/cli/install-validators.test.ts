@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 
 import { validateNonTuiArgs } from "./install-validators"
 import type { InstallArgs } from "./types"
@@ -19,10 +19,6 @@ function createArgs(overrides: Partial<InstallArgs> = {}): InstallArgs {
   }
 }
 
-afterEach(() => {
-  delete process.env.CI
-})
-
 describe("validateNonTuiArgs", () => {
   test("rejects invalid --opencode-go values", () => {
     // #given
@@ -40,21 +36,29 @@ describe("validateNonTuiArgs", () => {
 describe("printBox", () => {
   test("uses ASCII borders in CI", async () => {
     // given
+    const originalCI = process.env.CI
     process.env.CI = "true"
     const logs: string[] = []
     const logSpy = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
       logs.push(args.join(" "))
     })
-    const { printBox } = await import(`./install-validators?ci-box-${Date.now()}`)
+    try {
+      const { printBox } = await import(`./install-validators?ci-box-${Date.now()}`)
 
-    // when
-    printBox("hello", "Title")
+      // when
+      printBox("hello", "Title")
 
-    // then
-    expect(logSpy).toHaveBeenCalled()
-    expect(logs.join("\n")).toContain("+")
-    expect(logs.join("\n")).toContain("| hello")
-    expect(logs.join("\n")).not.toContain("┌")
-    expect(logs.join("\n")).not.toContain("│")
+      // then
+      const rendered = logs.join("\n").replace(new RegExp("\u001b\\[[0-9;]*m", "g"), "")
+      expect(logSpy).toHaveBeenCalled()
+      expect(rendered).toContain("+")
+      expect(rendered).toContain("| hello")
+      expect(rendered).not.toContain("┌")
+      expect(rendered).not.toContain("│")
+    } finally {
+      logSpy.mockRestore()
+      if (originalCI === undefined) delete process.env.CI
+      else process.env.CI = originalCI
+    }
   })
 })

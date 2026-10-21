@@ -118,7 +118,7 @@ describe("message.part.delta handling", () => {
       const rendered = stdoutSpy.mock.calls.map((call) => String(call[0] ?? "")).join("")
       expect(rendered).toContain("\u001b[38;2;0;206;209m")
       expect(rendered).toContain("claude-opus-4-7 (max)")
-      expect(rendered).toContain("└─")
+      expect(stripAnsi(rendered)).toMatch(/(?:└─|`-) Sisyphus - Ultraworker/)
       expect(rendered).toContain("Sisyphus - Ultraworker")
     } finally {
       stdoutSpy.mockRestore()
