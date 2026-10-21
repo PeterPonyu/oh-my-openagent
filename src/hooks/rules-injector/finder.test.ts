@@ -1,8 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { findProjectRoot, findRuleFiles } from "./finder";
+import { clearProjectRootCache } from "./project-root-finder";
 
 describe("findRuleFiles", () => {
   const TEST_DIR = join(tmpdir(), `rules-injector-test-${Date.now()}`);
@@ -372,10 +374,15 @@ describe("findProjectRoot", () => {
     const file = join(isolatedDir, "file.txt");
     writeFileSync(file, "content");
 
-    // when finding project root
-    const root = findProjectRoot(file);
-
-    // then should return null
-    expect(root).toBeNull();
+    // when no markers exist anywhere in the simulated ancestor walk
+    const markerLookup = spyOn(fs, "existsSync").mockReturnValue(false);
+    clearProjectRootCache();
+    try {
+      // then host-level markers outside the fixture do not affect the result
+      expect(findProjectRoot(file)).toBeNull();
+    } finally {
+      markerLookup.mockRestore();
+      clearProjectRootCache();
+    }
   });
 });
