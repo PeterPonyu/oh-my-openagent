@@ -6,13 +6,20 @@ import { delimiter, dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { createSandbox, credentialDigest, seedSandbox } from "./drive.mjs"
+import { isolatedChildEnv } from "./sandbox-child-env.mjs"
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const mockProviderEntry = join(scriptDir, "mock-provider", "index.ts")
 const realAgentDirs = [join(homedir(), ".senpi", "agent"), join(homedir(), ".omo", "agent")]
-const CO_AUTHOR_TRAILER = "Co-authored-by: sisyphus-dev-ai <sisyphus-dev-ai@users.noreply.github.com>"
+// The shipped contract (omo#7832) is that NO GitHub-resolvable co-author identity is ever
+// injected, so this driver looks for any Co-authored-by trailer rather than one known address:
+// pinning a single string would pass again the moment a different identity was introduced.
+const CO_AUTHOR_MARKER = "Co-authored-by:"
 const FOOTER_MARKER = "Ultraworked with"
 const SKILL_BODY_MARKER = "GIT MASTER LIVE QA BODY"
+const PREFIX_SECTION_MARKER = "GIT COMMAND PREFIX (MANDATORY)"
+// Only the rewrite of the seeded bash block can produce this line; the injected section has no `git add -A .`.
+const PREFIXED_COMMAND_MARKER = "GIT_MASTER=1 git add -A ."
 
 function findOnPath(bin) {
   if (bin.includes("/")) return existsSync(bin) ? bin : null
@@ -57,7 +64,7 @@ function seedScenario(sandbox, gitMasterConfig) {
   const skillPath = join(skillDir, "SKILL.md")
   writeFileSync(
     skillPath,
-    `---\nname: git-master\ndescription: Isolated live QA git-master skill\n---\n${SKILL_BODY_MARKER}\n`,
+    `---\nname: git-master\ndescription: Isolated live QA git-master skill\n---\n${SKILL_BODY_MARKER}\n\n\`\`\`bash\ngit add -A .\ngit commit -m "qa"\n\`\`\`\n`,
   )
   writeFileSync(join(sandbox.cwd, "mock-script.json"), `${JSON.stringify({
     steps: [
@@ -83,7 +90,7 @@ function runScenario(senpiBin, gitMasterConfig) {
       {
         cwd: sandbox.cwd,
         env: {
-          ...cleanEnv,
+          ...isolatedChildEnv(cleanEnv, sandbox.agentDir),
           SENPI_CODING_AGENT_DIR: sandbox.agentDir,
           XDG_CONFIG_HOME: sandbox.xdgConfigHome,
           SENPI_CODING_AGENT_SESSION_DIR: sessionDir,
@@ -100,8 +107,10 @@ function runScenario(senpiBin, gitMasterConfig) {
       exitStatus: run.status,
       readEventCount: count,
       bodyPresent: payload.includes(SKILL_BODY_MARKER),
-      trailerPresent: payload.includes(CO_AUTHOR_TRAILER),
+      trailerPresent: payload.includes(CO_AUTHOR_MARKER),
       footerPresent: payload.includes(FOOTER_MARKER),
+      prefixSectionPresent: payload.includes(PREFIX_SECTION_MARKER),
+      prefixedCommandPresent: payload.includes(PREFIXED_COMMAND_MARKER),
       sandboxAgentDir: sandbox.agentDir,
       stdout,
       stderr: run.stderr ?? "",
@@ -113,11 +122,11 @@ function runScenario(senpiBin, gitMasterConfig) {
 
 function selfTest() {
   const events = parseJsonLines(
-    `noise\n{"type":"tool_execution_end","toolName":"read","result":{"content":[{"type":"text","text":"${CO_AUTHOR_TRAILER}"}]}}\n{"type":"other"}\n`,
+    `noise\n{"type":"tool_execution_end","toolName":"read","result":{"content":[{"type":"text","text":"${FOOTER_MARKER} [omo]"}]}}\n{"type":"other"}\n`,
   )
   const { count, payload } = readToolEventsPayload(events)
   if (count !== 1) throw new Error("read event filter failed")
-  if (!payload.includes(CO_AUTHOR_TRAILER)) throw new Error("payload serialization failed")
+  if (!payload.includes(FOOTER_MARKER)) throw new Error("payload serialization failed")
   console.log("SELF-TEST OK")
 }
 
@@ -140,20 +149,28 @@ function main() {
   }
   const outDir = process.env.GIT_MASTER_ATTRIBUTION_E2E_OUT_DIR?.trim()
   const snapshots = realAgentDirs.map((dir) => ({ dir, before: credentialDigest(dir) }))
-  const enabled = runScenario(senpiBin, undefined)
-  const disabled = runScenario(senpiBin, { commit_footer: false, include_co_authored_by: false })
+  // Default install: only the GIT_MASTER=1 command prefix. Opt-in: plus the body footer, never a trailer.
+  const defaultOff = runScenario(senpiBin, undefined)
+  const optedIn = runScenario(senpiBin, { commit_footer: true })
+  const prefixOff = runScenario(senpiBin, { git_env_prefix: "" })
   const changedRealDirs = snapshots
     .filter(({ dir, before }) => before !== credentialDigest(dir))
     .map(({ dir }) => dir)
   const checks = {
-    enabled_process_exit: enabled.exitStatus === 0 ? "PASS" : "FAIL",
-    enabled_read_event: enabled.readEventCount >= 1 && enabled.bodyPresent ? "PASS" : "FAIL",
-    enabled_trailer_injected: enabled.trailerPresent ? "PASS" : "FAIL",
-    enabled_footer_injected: enabled.footerPresent ? "PASS" : "FAIL",
-    disabled_process_exit: disabled.exitStatus === 0 ? "PASS" : "FAIL",
-    disabled_read_event: disabled.readEventCount >= 1 && disabled.bodyPresent ? "PASS" : "FAIL",
-    disabled_trailer_absent: disabled.trailerPresent ? "FAIL" : "PASS",
-    disabled_footer_absent: disabled.footerPresent ? "FAIL" : "PASS",
+    default_process_exit: defaultOff.exitStatus === 0 ? "PASS" : "FAIL",
+    default_read_event: defaultOff.readEventCount >= 1 && defaultOff.bodyPresent ? "PASS" : "FAIL",
+    default_footer_absent: defaultOff.footerPresent ? "FAIL" : "PASS",
+    default_trailer_absent: defaultOff.trailerPresent ? "FAIL" : "PASS",
+    default_prefix_section: defaultOff.prefixSectionPresent ? "PASS" : "FAIL",
+    default_git_commands_prefixed: defaultOff.prefixedCommandPresent ? "PASS" : "FAIL",
+    opt_in_process_exit: optedIn.exitStatus === 0 ? "PASS" : "FAIL",
+    opt_in_read_event: optedIn.readEventCount >= 1 && optedIn.bodyPresent ? "PASS" : "FAIL",
+    opt_in_footer_injected: optedIn.footerPresent ? "PASS" : "FAIL",
+    opt_in_trailer_absent: optedIn.trailerPresent ? "FAIL" : "PASS",
+    prefix_off_process_exit: prefixOff.exitStatus === 0 ? "PASS" : "FAIL",
+    prefix_off_read_event: prefixOff.readEventCount >= 1 && prefixOff.bodyPresent ? "PASS" : "FAIL",
+    prefix_off_section_absent: prefixOff.prefixSectionPresent ? "FAIL" : "PASS",
+    prefix_off_commands_unprefixed: prefixOff.prefixedCommandPresent ? "FAIL" : "PASS",
     real_agent_dirs_untouched: changedRealDirs.length === 0 ? "PASS" : "FAIL",
   }
   const result = Object.values(checks).every((value) => value === "PASS") ? "PASS" : "FAIL"
@@ -162,9 +179,17 @@ function main() {
     checks,
     realAgentDirsUntouched: changedRealDirs.length === 0,
     changedRealDirs,
-    sandboxAgentDirs: { enabled: enabled.sandboxAgentDir, disabled: disabled.sandboxAgentDir },
+    sandboxAgentDirs: {
+      default: defaultOff.sandboxAgentDir,
+      optIn: optedIn.sandboxAgentDir,
+      prefixOff: prefixOff.sandboxAgentDir,
+    },
   }
-  writeEvidence(outDir ? resolve(outDir) : undefined, payload, { enabled, disabled })
+  writeEvidence(outDir ? resolve(outDir) : undefined, payload, {
+    default: defaultOff,
+    "opt-in": optedIn,
+    "prefix-off": prefixOff,
+  })
   console.log(JSON.stringify(payload))
   process.exitCode = result === "PASS" ? 0 : 1
 }
