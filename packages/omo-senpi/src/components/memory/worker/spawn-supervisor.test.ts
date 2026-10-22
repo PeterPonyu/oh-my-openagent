@@ -232,6 +232,40 @@ describe("supervised child outcome authority", () => {
 })
 
 describe("supervised supervisor-stderr diagnostics", () => {
+  test("#given a noisy supervisor still holding stderr open #when publication times out #then a bounded snapshot preserves the timeout without replacing its live log", async () => {
+    // given
+    const prepared = await prepareSupervisedRun("supervisor-live-stderr-", "run-live-stderr")
+    const maxOutputBytes = 1024
+    const run = runReflectionChild({
+      ...prepared.spawnArgs,
+      hardDeadlineAt: Date.now() - 5_000,
+      env: { FIXTURE_NOISY_SUPERVISOR: "1" },
+    }, {
+      maxOutputBytes,
+      supervisorPath: join(import.meta.dir, "__fixtures__", "supervisor-never-publishes.ts"),
+    })
+
+    // when
+    try {
+      await expect(run).rejects.toThrow("memory run supervisor did not publish an outcome before its deadline")
+
+      // then: the live supervisor owns its original stderr handle until explicitly released.
+      expect(existsSync(join(prepared.runDir, "released.json"))).toBe(false)
+      const liveLog = await readFile(join(prepared.runDir, "supervisor-stderr.log"), "utf8")
+      expect(liveLog).toContain("x".repeat(4096))
+      const snapshot = await readFile(join(prepared.runDir, "supervisor-stderr-tail.log"), "utf8")
+      expect(snapshot.startsWith(`[truncated to last ${maxOutputBytes} bytes]\n`)).toBe(true)
+      expect(Buffer.byteLength(snapshot, "utf8")).toBeLessThanOrEqual(
+        Buffer.byteLength(`[truncated to last ${maxOutputBytes} bytes]\n`, "utf8") + maxOutputBytes,
+      )
+      expect(snapshot).toContain("fixture supervisor is still alive")
+      expect(existsSync(join(prepared.runDir, "outcome.json"))).toBe(false)
+    } finally {
+      await writeFile(join(prepared.runDir, "release"), "")
+      expect(await waitForRunSentinel(join(prepared.runDir, "released.json"), Date.now() + 5_000, Date.now)).toBe("present")
+    }
+  }, 30_000)
+
   test("#given a supervisor that throws before publishing #when the parent completes #then stderr is retained locally and only a distilled cause is surfaced", async () => {
     // given
     const prepared = await prepareSupervisedRun("supervisor-throws-", "run-throws")

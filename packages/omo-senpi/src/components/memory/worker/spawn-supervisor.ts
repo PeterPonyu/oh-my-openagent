@@ -239,10 +239,13 @@ async function runSupervisedChild(input: {
     )
   }
   if (result.kind === "outcome" && result.result === "timeout") {
+    // The supervisor can still own the inherited stderr handle. Windows cannot replace that live
+    // file, so preserve it and publish the bounded diagnostic under a separate snapshot path.
     throw await supervisorFailure(
       "memory run supervisor did not publish an outcome before its deadline",
       supervisorStderrPath,
       input.maxOutputBytes,
+      join(input.runDir, "supervisor-stderr-tail.log"),
     )
   }
   const outcome = await readRunJson<RunOutcome>(outcomePath)
@@ -258,16 +261,16 @@ async function runSupervisedChild(input: {
   }
 }
 
-async function supervisorFailure(message: string, stderrPath: string, maxBytes: number): Promise<Error> {
-  const stderr = await retainBoundedSupervisorStderr(stderrPath, maxBytes)
+async function supervisorFailure(
+  message: string,
+  stderrPath: string,
+  maxBytes: number,
+  snapshotPath = stderrPath,
+): Promise<Error> {
+  const stderr = await readRunTextTail(stderrPath, maxBytes)
+  await writeRunTextAtomic(snapshotPath, stderr)
   const cause = childFailureCause(stderr)
   return new Error(cause === undefined ? message : `${message}: ${cause}`)
-}
-
-async function retainBoundedSupervisorStderr(path: string, maxBytes: number): Promise<string> {
-  const tail = await readRunTextTail(path, maxBytes)
-  await writeRunTextAtomic(path, tail)
-  return tail
 }
 
 function launchedRun(ledger: Readonly<Record<string, unknown>>): RunReceiptLedger {
