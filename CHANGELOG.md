@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-**Cancelling an in-process task before its first turn starts no longer leaves the parent running.** Cancellation now reaches prompt preflight as well as an active turn, so the child cannot start work after it was cancelled. Each new turn receives a fresh cancellation signal.
+**Cancelling an in-process task before its first turn starts no longer leaves the parent running.** Cancellation now reaches prompt preflight as well as an active turn, so the child cannot start work after it was cancelled. Each new turn receives a fresh cancellation signal. ([#8151](https://github.com/code-yeongyu/oh-my-openagent/pull/8151))
 
 **Outside full access, computer use asks before it acts on your screen as a whole.** Clicks, typing, key presses, scrolling, drags, pointer moves and holds aimed at the desktop or a display land on your real pointer and frontmost app, so they now need the same "Allow foreground computer control?" approval as foreground input; without it they fail with `ControlRequired` and nothing is sent. Input to one window in the background still needs no approval, and full access keeps working without a prompt, headless runs included. The macOS background check no longer moves your pointer back after you moved it, and a stopped session stays stopped when the desktop engine restarts. ([#10788](https://github.com/code-yeongyu/oh-my-openagent/issues/10788), [#10790](https://github.com/code-yeongyu/oh-my-openagent/pull/10790))
 
